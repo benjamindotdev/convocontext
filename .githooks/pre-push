@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REMOTE_NAME="${1:-origin}"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # Only enforce branch pushes; tags and other refs pass through.
+  if [[ "${remote_ref}" != refs/heads/* ]]; then
+    continue
+  fi
+
+  remote_branch="${remote_ref#refs/heads/}"
+  local_branch="${local_ref#refs/heads/}"
+
+  if [[ "${remote_branch}" == "main" ]]; then
+    cat <<'EOF'
+Push blocked: direct pushes to 'main' are disabled.
+Open a pull request from 'dev' into 'main' instead.
+EOF
+    exit 1
+  fi
+
+  if [[ "${remote_branch}" != "dev" || "${local_branch}" != "dev" ]]; then
+    cat <<EOF
+Push blocked: only 'dev' may be pushed directly.
+Tried to push local '${local_branch}' to remote '${remote_branch}' on '${REMOTE_NAME}'.
+EOF
+    exit 1
+  fi
+done
+
+exit 0

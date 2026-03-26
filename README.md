@@ -47,3 +47,18 @@ Open http://localhost:3000.
 - `POST /api/analyze` accepts raw WhatsApp export text and returns/stores layered analysis.
 - `GET /api/conversations` lists saved analyses from Convex.
 - `GET /api/conversations/:id` fetches a saved conversation plus analysis details.
+
+## Local Branch Protection
+
+This repo uses a local `pre-push` hook (in `.githooks/pre-push`) with this policy:
+
+- direct pushes to `main` are blocked
+- only `dev` can be pushed directly
+- changes should flow `dev` -> PR -> `main`
+
+To enable hooks locally:
+
+```bash
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-push
+```
