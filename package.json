@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test:local-txt": "node scripts/test-local-txt.mjs",
     "convex:dev": "convex dev",
     "convex:deploy": "convex deploy"
   },

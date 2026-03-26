@@ -8,6 +8,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const rawConversation = String(body?.conversation ?? "").trim();
+    const providedTitle = String(body?.title ?? "").trim();
 
     if (!rawConversation) {
       return NextResponse.json(
@@ -29,7 +30,7 @@ export async function POST(request: Request) {
     }
 
     const analysis = await analyzeConversation(messages);
-    const title = suggestConversationTitle(messages);
+    const title = providedTitle || suggestConversationTitle(messages);
 
     let conversationId: string | null = null;
 

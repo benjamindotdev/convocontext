@@ -23,7 +23,8 @@ export async function analyzeConversation(
     throw new Error("ANTHROPIC_API_KEY is missing. Add it to your environment.");
   }
 
-  const model = anthropic("claude-3-5-sonnet-latest");
+  const modelName = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+  const model = anthropic(modelName);
 
   const people = await runPeopleLayer(messages, model);
   const events = await runEventsLayer(messages, people, model);
