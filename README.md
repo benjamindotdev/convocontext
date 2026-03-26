@@ -1,36 +1,49 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ConvoContext
 
-## Getting Started
+ConvoContext analyzes full WhatsApp conversation history for legal context using layered AI extraction:
 
-First, run the development server:
+1. `people.ts` finds key individuals and aliases.
+2. `events.ts` extracts concrete incidents with evidence lines.
+3. `themes.ts` decides whether each topic belongs to an existing theme or a newly created theme.
+
+The app uses:
+
+- Next.js + TypeScript + Tailwind + shadcn/ui
+- Anthropic via Next.js AI SDK
+- Convex as a free hosted database option
+
+## Environment Variables
+
+Copy `.env.example` to `.env.local` and set:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+ANTHROPIC_API_KEY=...
+CONVEX_URL=...
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`CONVEX_URL` is optional if you only want in-memory analysis results.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Convex Setup
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Run once to initialize Convex and create your cloud deployment:
 
-## Learn More
+```bash
+npm run convex:dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+After setup, Convex functions in `convex/` are ready to store and retrieve analyses.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Run Locally
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+npm install
+npm run dev
+```
 
-## Deploy on Vercel
+Open http://localhost:3000.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## API Endpoints
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `POST /api/analyze` accepts raw WhatsApp export text and returns/stores layered analysis.
+- `GET /api/conversations` lists saved analyses from Convex.
+- `GET /api/conversations/:id` fetches a saved conversation plus analysis details.
