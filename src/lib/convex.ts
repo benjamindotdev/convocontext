@@ -17,7 +17,7 @@ export const convexFns = {
 };
 
 export function getConvexAdminClient(): ConvexHttpClient | null {
-  const convexUrl = process.env.CONVEX_URL;
+  const convexUrl = process.env.CONVEX_URL || process.env.NEXT_PUBLIC_CONVEX_URL;
 
   if (!convexUrl) {
     return null;
