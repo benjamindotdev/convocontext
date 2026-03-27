@@ -1,49 +1,83 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
-const messageValidator = v.object({
-  speaker: v.string(),
-  text: v.string(),
-  timestamp: v.optional(v.string()),
-  line: v.number(),
-});
-
-const personValidator = v.object({
-  name: v.string(),
-  aliases: v.array(v.string()),
-  summary: v.string(),
-  messageCount: v.number(),
-});
-
-const eventValidator = v.object({
-  title: v.string(),
-  description: v.string(),
-  participants: v.array(v.string()),
-  timeframe: v.string(),
-  evidenceLines: v.array(v.number()),
-  topics: v.array(v.string()),
-});
-
-const themeValidator = v.object({
-  name: v.string(),
-  description: v.string(),
-  keywords: v.array(v.string()),
-  eventTitles: v.array(v.string()),
-  confidence: v.number(),
-});
-
 export default defineSchema({
   conversations: defineTable({
     title: v.string(),
     rawText: v.string(),
+    conversationHash: v.string(),
     createdAt: v.number(),
-  }),
-  analyses: defineTable({
+    analyzedAt: v.number(),
+  }).index("by_conversation_hash", ["conversationHash"]),
+  messages: defineTable({
     conversationId: v.id("conversations"),
-    messages: v.array(messageValidator),
-    people: v.array(personValidator),
-    events: v.array(eventValidator),
-    themes: v.array(themeValidator),
+    line: v.number(),
+    speaker: v.string(),
+    text: v.string(),
+    timestamp: v.optional(v.string()),
     createdAt: v.number(),
-  }).index("by_conversation", ["conversationId"]),
+  }).index("by_conversation_and_line", ["conversationId", "line"]),
+  people: defineTable({
+    conversationId: v.id("conversations"),
+    name: v.string(),
+    nameNormalized: v.string(),
+    aliases: v.array(v.string()),
+    summary: v.string(),
+    messageCount: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_conversation_and_name_normalized", ["conversationId", "nameNormalized"]),
+  events: defineTable({
+    conversationId: v.id("conversations"),
+    title: v.string(),
+    titleNormalized: v.string(),
+    description: v.string(),
+    participants: v.array(v.string()),
+    timeframe: v.string(),
+    evidenceLines: v.array(v.number()),
+    topics: v.array(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_conversation_and_title_normalized", ["conversationId", "titleNormalized"]),
+  themes: defineTable({
+    conversationId: v.id("conversations"),
+    name: v.string(),
+    nameNormalized: v.string(),
+    description: v.string(),
+    keywords: v.array(v.string()),
+    eventTitles: v.array(v.string()),
+    confidence: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_conversation_and_name_normalized", ["conversationId", "nameNormalized"]),
+  messagePeople: defineTable({
+    conversationId: v.id("conversations"),
+    messageId: v.id("messages"),
+    personId: v.id("people"),
+    createdAt: v.number(),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_message_and_person", ["messageId", "personId"])
+    .index("by_person", ["personId"]),
+  messageEvents: defineTable({
+    conversationId: v.id("conversations"),
+    messageId: v.id("messages"),
+    eventId: v.id("events"),
+    createdAt: v.number(),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_message_and_event", ["messageId", "eventId"])
+    .index("by_event", ["eventId"]),
+  messageThemes: defineTable({
+    conversationId: v.id("conversations"),
+    messageId: v.id("messages"),
+    themeId: v.id("themes"),
+    createdAt: v.number(),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_message_and_theme", ["messageId", "themeId"])
+    .index("by_theme", ["themeId"]),
 });

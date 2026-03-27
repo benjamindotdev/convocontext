@@ -21,13 +21,31 @@ EOF
     exit 1
   fi
 
-  if [[ "${remote_branch}" != "dev" || "${local_branch}" != "dev" ]]; then
-    cat <<EOF
-Push blocked: only 'dev' may be pushed directly.
+  if [[ "${remote_branch}" == "dev" && "${local_branch}" == "dev" ]]; then
+    continue
+  fi
+
+  if [[ "${remote_branch}" == feat/* && "${local_branch}" == feat/* ]]; then
+    continue
+  fi
+
+  if [[ "${remote_branch}" == "fix"/* && "${local_branch}" == "fix"/* ]]; then
+    continue
+  fi
+
+  if [[ "${remote_branch}" == "chore"/* && "${local_branch}" == "chore"/* ]]; then
+    continue
+  fi
+
+  if [[ "${remote_branch}" == "hotfix"/* && "${local_branch}" == "hotfix"/* ]]; then
+    continue
+  fi
+
+  cat <<EOF
+Push blocked: allowed direct pushes are 'dev', 'feat/*', 'fix/*', 'chore/*', 'hotfix/*'.
 Tried to push local '${local_branch}' to remote '${remote_branch}' on '${REMOTE_NAME}'.
 EOF
-    exit 1
-  fi
+  exit 1
 done
 
 exit 0

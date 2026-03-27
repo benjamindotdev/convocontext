@@ -22,6 +22,7 @@ export async function runThemesLayer(
   _messages: ParsedMessage[],
   events: EventSummary[],
   model: ModelLike,
+  onProgress?: (themes: ThemeSummary[]) => void,
 ): Promise<ThemeSummary[]> {
   const themes: ThemeSummary[] = [];
 
@@ -56,6 +57,7 @@ export async function runThemesLayer(
           match.eventTitles = Array.from(new Set([...match.eventTitles, event.title]));
           match.keywords = Array.from(new Set([...match.keywords, ...object.keywords]));
           match.confidence = Math.max(match.confidence, object.confidence);
+          onProgress?.([...themes]);
           continue;
         }
       }
@@ -79,6 +81,7 @@ export async function runThemesLayer(
           existingWithSameName.confidence,
           object.confidence,
         );
+        onProgress?.([...themes]);
         continue;
       }
 
@@ -89,6 +92,8 @@ export async function runThemesLayer(
         eventTitles: [event.title],
         confidence: object.confidence,
       });
+
+      onProgress?.([...themes]);
     }
   }
 
