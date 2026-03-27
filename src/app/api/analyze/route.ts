@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { analyzeConversation, suggestConversationTitle } from "@/lib/analysis";
 import { convexFns, getConvexAdminClient } from "@/lib/convex";
+import { sha256Hex } from "@/lib/hash";
 import { parseWhatsAppConversation } from "@/lib/whatsapp";
 
 export async function POST(request: Request) {
@@ -31,25 +32,49 @@ export async function POST(request: Request) {
 
     const analysis = await analyzeConversation(messages);
     const title = providedTitle || suggestConversationTitle(messages);
+    const conversationHash = await sha256Hex(rawConversation);
 
     let conversationId: string | null = null;
+    let duplicate = false;
 
     const convex = getConvexAdminClient();
 
     if (convex) {
-      conversationId = await convex.mutation(convexFns.saveConversationAnalysis, {
+      const existing = await convex.query(convexFns.checkConversationHashes, {
+        hashes: [conversationHash],
+      });
+
+      if (existing.length > 0) {
+        return NextResponse.json(
+          {
+            error: "This conversation has already been analyzed.",
+            duplicate: true,
+            conversationId: existing[0].conversationId,
+            existingTitle: existing[0].title,
+          },
+          { status: 409 },
+        );
+      }
+
+      const persisted = await convex.mutation(convexFns.saveConversationAnalysis, {
         title,
         rawText: rawConversation,
+        conversationHash,
         messages: analysis.messages,
         people: analysis.people,
         events: analysis.events,
         themes: analysis.themes,
       });
+
+      conversationId = persisted.conversationId;
+      duplicate = persisted.duplicate;
     }
 
     return NextResponse.json({
       title,
       conversationId,
+      duplicate,
+      conversationHash,
       persisted: Boolean(conversationId),
       analysis,
     });

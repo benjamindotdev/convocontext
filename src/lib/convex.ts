@@ -5,6 +5,9 @@ export const convexFns = {
   saveConversationAnalysis: makeFunctionReference<"mutation">(
     "conversations:saveConversationAnalysis",
   ),
+  checkConversationHashes: makeFunctionReference<"query">(
+    "conversations:checkConversationHashes",
+  ),
   listConversations: makeFunctionReference<"query">(
     "conversations:listConversations",
   ),
