@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { analyzeConversation, suggestConversationTitle } from "@/lib/analysis";
 import { convexFns, getConvexAdminClient } from "@/lib/convex";
 import { sha256Hex } from "@/lib/hash";
+import { createLogger, errorMeta } from "@/lib/logger";
 import { parseWhatsAppConversation } from "@/lib/whatsapp";
 
 function normalize(value: string): string {
@@ -25,12 +26,21 @@ function lastNamesFromFullName(value: string): string[] {
 }
 
 export async function POST(request: Request) {
+  const requestId = crypto.randomUUID();
+  const logger = createLogger("api.analyze.route", { requestId });
+
   try {
     const body = await request.json();
     const rawConversation = String(body?.conversation ?? "").trim();
     const providedTitle = String(body?.title ?? "").trim();
 
+    logger.info("request_received", {
+      rawChars: rawConversation.length,
+      titleProvided: providedTitle.length > 0,
+    });
+
     if (!rawConversation) {
+      logger.warn("empty_conversation");
       return NextResponse.json(
         { error: "Conversation text is required." },
         { status: 400 },
@@ -38,8 +48,10 @@ export async function POST(request: Request) {
     }
 
     const messages = parseWhatsAppConversation(rawConversation);
+    logger.info("conversation_parsed", { messageCount: messages.length });
 
     if (messages.length === 0) {
+      logger.warn("parse_failed_zero_messages");
       return NextResponse.json(
         {
           error:
@@ -52,6 +64,12 @@ export async function POST(request: Request) {
     const analysis = await analyzeConversation(messages);
     const title = providedTitle || suggestConversationTitle(messages);
     const conversationHash = await sha256Hex(rawConversation);
+    logger.info("analysis_complete", {
+      title,
+      peopleCount: analysis.people.length,
+      eventsCount: analysis.events.length,
+      themesCount: analysis.themes.length,
+    });
 
     let conversationId: string | null = null;
     let duplicate = false;
@@ -61,17 +79,22 @@ export async function POST(request: Request) {
       incomingLastNames: string[];
       existingName: string;
       existingLastNames: string[];
-      conversationId: string;
+      activeConversationId: string[];
+      passiveConversationId: string[];
     }> = [];
 
     const convex = getConvexAdminClient();
 
     if (convex) {
+      logger.info("convex_available");
       const existing = await convex.query(convexFns.checkConversationHashes, {
         hashes: [conversationHash],
       });
 
       if (existing.length > 0) {
+        logger.info("duplicate_detected", {
+          existingConversationId: existing[0].conversationId,
+        });
         return NextResponse.json(
           {
             error: "This conversation has already been analyzed.",
@@ -134,7 +157,8 @@ export async function POST(request: Request) {
               incomingLastNames,
               existingName: match.personName,
               existingLastNames,
-              conversationId: match.conversationId,
+              activeConversationId: match.activeConversationId || [],
+              passiveConversationId: match.passiveConversationId || [],
             });
           }
         }
@@ -152,7 +176,18 @@ export async function POST(request: Request) {
 
       conversationId = persisted.conversationId;
       duplicate = persisted.duplicate;
+      logger.info("persist_complete", {
+        conversationId,
+        duplicate,
+      });
+    } else {
+      logger.warn("convex_not_configured");
     }
+
+    logger.info("request_complete", {
+      persisted: Boolean(conversationId),
+      peopleFirstNameConflicts: peopleFirstNameConflicts.length,
+    });
 
     return NextResponse.json({
       title,
@@ -165,6 +200,9 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
+    logger.error("request_failed", {
+      ...errorMeta(error),
+    });
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

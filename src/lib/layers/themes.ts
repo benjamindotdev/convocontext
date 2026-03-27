@@ -1,6 +1,8 @@
 import { generateObject } from "ai";
 import { z } from "zod";
 
+import { runWithRetry } from "@/lib/layers/common";
+import { createLogger } from "@/lib/logger";
 import { EventSummary, ParsedMessage, ThemeSummary } from "@/lib/types";
 
 type ModelLike = Parameters<typeof generateObject>[0]["model"];
@@ -24,28 +26,45 @@ export async function runThemesLayer(
   model: ModelLike,
   onProgress?: (themes: ThemeSummary[]) => void,
 ): Promise<ThemeSummary[]> {
+  const logger = createLogger("layers.themes", {
+    eventCount: events.length,
+  });
   const themes: ThemeSummary[] = [];
+
+  logger.info("start", { eventCount: events.length });
 
   for (const event of events) {
     const topicList = event.topics.length > 0 ? event.topics : [event.title];
 
     for (const topic of topicList) {
-      const { object } = await generateObject({
-        model,
-        schema: assignmentSchema,
-        temperature: 0.1,
-        system:
-          "You decide whether a topic belongs to an existing legal theme or requires a new theme.",
-        prompt: [
-          "Classify this topic into existing themes or create a new one.",
-          "Return matchType='existing' only when semantic overlap is strong.",
-          "",
-          `Topic: ${topic}`,
-          `Event: ${event.title}`,
-          `Event description: ${event.description}`,
-          `Existing themes: ${JSON.stringify(themes)}`,
-        ].join("\n"),
-      });
+      const { object } = await runWithRetry(
+        () =>
+          generateObject({
+            model,
+            schema: assignmentSchema,
+            temperature: 0.1,
+            system:
+              "You decide whether a topic belongs to an existing legal theme or requires a new theme.",
+            prompt: [
+              "Classify this topic into existing themes or create a new one.",
+              "Return matchType='existing' only when semantic overlap is strong.",
+              "",
+              `Topic: ${topic}`,
+              `Event: ${event.title}`,
+              `Event description: ${event.description}`,
+              `Existing themes: ${JSON.stringify(themes)}`,
+            ].join("\n"),
+          }),
+        {
+          operationName: "assign_theme_for_topic",
+          logger,
+          inputMeta: {
+            eventTitle: event.title,
+            topic,
+            existingThemes: themes.length,
+          },
+        },
+      );
 
       if (object.matchType === "existing" && object.matchedThemeName) {
         const match = themes.find(
@@ -97,5 +116,6 @@ export async function runThemesLayer(
     }
   }
 
+  logger.info("complete", { themeCount: themes.length });
   return themes;
 }

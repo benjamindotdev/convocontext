@@ -7,6 +7,10 @@ import { useTheme } from "next-themes";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  PeopleReviewModal,
+  PeopleReviewPerson,
+} from "@/components/people-review-modal";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -274,6 +278,7 @@ type StreamPayload = {
   title?: string;
   layer?: string;
   count?: number;
+  resumedFromReview?: boolean;
   conversationId?: string;
   conversationHash?: string;
   existingTitle?: string;
@@ -284,13 +289,10 @@ type StreamPayload = {
   events?: EventSummary[];
   themes?: ThemeSummary[];
   conflicts?: Array<{
-    firstName: string;
     incomingName: string;
-    incomingLastNames: string[];
     existingName: string;
-    existingLastNames: string[];
-    conversationId: string;
   }>;
+  reviewPeople?: PeopleReviewPerson[];
 };
 
 type StreamEvent = {
@@ -301,7 +303,7 @@ type StreamEvent = {
 type StreamHistoryItem = {
   id: string;
   timestamp: number;
-  event: string;
+  title: string;
   chatId?: string;
   layer?: string;
   detail: string;
@@ -325,6 +327,7 @@ export default function Home() {
   const [peopleCollapsed, setPeopleCollapsed] = useState(true);
   const [eventsCollapsed, setEventsCollapsed] = useState(true);
   const [themesCollapsed, setThemesCollapsed] = useState(true);
+  const [peopleSearchQuery, setPeopleSearchQuery] = useState("");
   const [eventSort, setEventSort] = useState<EventSortOption>("alphabet");
   const [eventSortDirection, setEventSortDirection] = useState<SortDirection>("asc");
   const [themeSort, setThemeSort] = useState<ThemeSortOption>("alphabet");
@@ -334,9 +337,24 @@ export default function Home() {
   const [selectedEvents, setSelectedEvents] = useState<string[]>([]);
   const [selectedThemes, setSelectedThemes] = useState<string[]>([]);
   const [hasMounted, setHasMounted] = useState(false);
+  const [peopleReviewModalOpen, setPeopleReviewModalOpen] = useState(false);
+  const [peopleReviewChatTitle, setPeopleReviewChatTitle] = useState<string>("");
+  const [peopleReviewChatId, setPeopleReviewChatId] = useState<string>("");
+  const [peopleReviewPeople, setPeopleReviewPeople] = useState<PeopleReviewPerson[]>([]);
+  const [peopleReviewFieldDecisions, setPeopleReviewFieldDecisions] = useState<
+    Record<
+      string,
+      {
+        fullName: boolean;
+        firstName: boolean;
+        lastNames: boolean;
+        aliases: boolean;
+      }
+    >
+  >({});
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const promptedConflictKeysRef = useRef<Set<string>>(new Set());
+  const promptedPeopleReviewRef = useRef<Set<string>>(new Set());
 
   const refreshLibraryConversations = async () => {
     setIsLibraryLoading(true);
@@ -381,21 +399,72 @@ export default function Home() {
   const pushStreamHistory = (streamEvent: StreamEvent) => {
     const { event, data } = streamEvent;
 
-    let detail = event;
-    if (event === "chat_started") detail = `Started ${data.title || data.chatId || "chat"}`;
-    if (event === "layer_started") detail = `Layer started: ${data.layer || "unknown"}`;
-    if (event === "layer_done") detail = `Layer done: ${data.layer || "unknown"} (${data.count ?? 0})`;
-    if (event === "people_delta") detail = `People updated (${data.people?.length ?? 0})`;
-    if (event === "events_delta") detail = `Events updated (${data.events?.length ?? 0})`;
-    if (event === "themes_delta") detail = `Themes updated (${data.themes?.length ?? 0})`;
-    if (event === "chat_done") detail = `Completed ${data.title || data.chatId || "chat"}`;
-    if (event === "chat_error") detail = `Error: ${data.error || "Unexpected error"}`;
-    if (event === "chat_duplicate") detail = `Duplicate skipped: ${data.error || "Already analyzed"}`;
-    if (event === "session_started") detail = "Session started";
-    if (event === "session_done") detail = "Session completed";
-    if (event === "session_error") detail = `Session error: ${data.error || "Unexpected error"}`;
-    if (event === "people_first_name_conflicts") {
-      detail = `Name conflicts detected (${data.conflicts?.length ?? 0})`;
+    let title = "Update";
+    let detail = "Pipeline updated.";
+
+    if (event === "chat_started") {
+      title = "Chat Started";
+      detail = `Started ${data.title || data.chatId || "chat"}.`;
+    }
+    if (event === "layer_started") {
+      title = "Layer Started";
+      detail = `Running ${data.layer || "unknown"} layer.`;
+    }
+    if (event === "layer_done") {
+      title = "Layer Complete";
+      detail = `Finished ${data.layer || "unknown"} layer (${data.count ?? 0}).`;
+    }
+    if (event === "people_delta") {
+      title = "People Updated";
+      detail = `${data.people?.length ?? 0} people loaded.`;
+    }
+    if (event === "events_delta") {
+      title = "Events Updated";
+      detail = `${data.events?.length ?? 0} events loaded.`;
+    }
+    if (event === "themes_delta") {
+      title = "Themes Updated";
+      detail = `${data.themes?.length ?? 0} themes loaded.`;
+    }
+    if (event === "chat_done") {
+      title = "Chat Complete";
+      detail = `${data.title || data.chatId || "Chat"} finished.`;
+    }
+    if (event === "chat_error") {
+      title = "Chat Error";
+      detail = data.error || "Unexpected error.";
+    }
+    if (event === "chat_duplicate") {
+      title = "Duplicate Skipped";
+      detail = data.error || "Already analyzed.";
+    }
+    if (event === "session_started") {
+      title = data.resumedFromReview ? "Resume Started" : "Session Started";
+      detail = data.resumedFromReview
+        ? "Continuing analysis after people review."
+        : "Analysis session started.";
+    }
+    if (event === "session_done") {
+      title = data.resumedFromReview ? "Resume Complete" : "Session Complete";
+      detail = data.resumedFromReview
+        ? "Review continuation finished."
+        : "All chats finished.";
+    }
+    if (event === "session_error") {
+      title = "Session Error";
+      detail = data.error || "Unexpected error.";
+    }
+    if (event === "people_review_prompt") {
+      title = "Review Needed";
+      detail = `Please confirm ${data.reviewPeople?.length ?? 0} people before continuing.`;
+    }
+    if (event === "chat_paused_review") {
+      title = "Paused For Review";
+      detail = "Chat paused while waiting for people review.";
+    }
+    if (event === "session_paused_review") {
+      title = "Session Paused";
+      detail = "Session paused for people review.";
     }
 
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -405,7 +474,7 @@ export default function Home() {
         {
           id,
           timestamp: Date.now(),
-          event,
+          title,
           chatId: data.chatId,
           layer: data.layer,
           detail,
@@ -515,32 +584,47 @@ export default function Home() {
       return;
     }
 
-    if (event === "people_first_name_conflicts") {
-      const conflicts = data.conflicts || [];
+    if (event === "people_review_prompt") {
+      const people = data.reviewPeople || [];
+      const reviewKey = `${chatId}:${people.map((person) => person.fullName).join("|")}`;
 
-      for (const conflict of conflicts) {
-        const key = `${chatId}:${conflict.incomingName}:${conflict.existingName}`;
-        if (promptedConflictKeysRef.current.has(key)) {
-          continue;
-        }
-        promptedConflictKeysRef.current.add(key);
-
-        const incomingLast = conflict.incomingLastNames.join(" ") || "(none)";
-        const existingLast = conflict.existingLastNames.join(" ") || "(none)";
-
-        const samePerson = window.confirm(
-          `First-name match found for "${conflict.firstName}".\n\n` +
-            `Incoming person: ${conflict.incomingName} [${incomingLast}]\n` +
-            `Existing DB person: ${conflict.existingName} [${existingLast}]\n\n` +
-            "Are these the same person?",
-        );
-
-        if (!samePerson) {
-          setError(
-            `Keeping as separate people: ${conflict.incomingName} vs ${conflict.existingName}.`,
-          );
-        }
+      if (promptedPeopleReviewRef.current.has(reviewKey)) {
+        return;
       }
+      promptedPeopleReviewRef.current.add(reviewKey);
+
+      const initialFieldDecisions: Record<
+        string,
+        {
+          fullName: boolean;
+          firstName: boolean;
+          lastNames: boolean;
+          aliases: boolean;
+        }
+      > = {};
+
+      for (const person of people) {
+        initialFieldDecisions[person.fullName] = {
+          fullName: true,
+          firstName: true,
+          lastNames: true,
+          aliases: true,
+        };
+      }
+
+      setPeopleReviewChatTitle(data.title || "");
+      setPeopleReviewChatId(chatId);
+      setPeopleReviewPeople(people);
+      setPeopleReviewFieldDecisions(initialFieldDecisions);
+      setPeopleReviewModalOpen(true);
+
+      return;
+    }
+
+    if (event === "chat_paused_review" || event === "session_paused_review") {
+      setIsAnalyzing(false);
+      setActiveLayerLabel("");
+      setActiveChatLabel("");
       return;
     }
 
@@ -888,6 +972,39 @@ export default function Home() {
     return copy;
   }, [unified.themes, themeSort, themeSortDirection]);
 
+  const filteredPeople = useMemo(() => {
+    const query = normalize(peopleSearchQuery);
+
+    return unified.people
+      .map((person) => {
+        const matchedMessages =
+          query.length === 0
+            ? person.linkedMessages
+            : person.linkedMessages.filter((message) => {
+                const haystack = `${message.speaker} ${message.text} ${message.chat} ${message.timestamp || ""}`
+                  .toLowerCase();
+                return haystack.includes(query);
+              });
+
+        const personMatchesQuery =
+          query.length === 0 ||
+          person.name.toLowerCase().includes(query) ||
+          person.aliases.some((alias) => alias.toLowerCase().includes(query));
+
+        if (!personMatchesQuery && matchedMessages.length === 0) {
+          return null;
+        }
+
+        return {
+          person,
+          matchedMessages,
+        };
+      })
+      .filter(
+        (entry): entry is { person: UnifiedPerson; matchedMessages: MessageRef[] } => Boolean(entry),
+      );
+  }, [unified.people, peopleSearchQuery]);
+
   const rawMessageById = useMemo(() => {
     const map = new Map<string, string>();
 
@@ -1042,6 +1159,184 @@ export default function Home() {
     URL.revokeObjectURL(url);
 
     setIsExportModalOpen(false);
+  };
+
+  const updatePersonFieldDecision = (
+    fullName: string,
+    field: "fullName" | "firstName" | "lastNames" | "aliases",
+    value: boolean,
+  ) => {
+    setPeopleReviewFieldDecisions((current) => ({
+      ...current,
+      [fullName]: {
+        fullName: current[fullName]?.fullName ?? true,
+        firstName: current[fullName]?.firstName ?? true,
+        lastNames: current[fullName]?.lastNames ?? true,
+        aliases: current[fullName]?.aliases ?? true,
+        [field]: value,
+      },
+    }));
+  };
+
+  const savePeopleReview = async () => {
+    const chat = sessionChats.find((item) => item.id === peopleReviewChatId);
+    if (!chat) {
+      setError("Could not resume analysis: chat not found.");
+      setPeopleReviewModalOpen(false);
+      return;
+    }
+
+    // Close immediately so save action always feels responsive.
+    setPeopleReviewModalOpen(false);
+    setIsAnalyzing(true);
+    setActiveChatLabel(chat.title || chat.fileName);
+    setActiveLayerLabel("review");
+
+    const reviewedPeople: PersonSummary[] = peopleReviewPeople
+      .map((person) => {
+        const selection = peopleReviewFieldDecisions[person.fullName] || {
+          fullName: true,
+          firstName: true,
+          lastNames: true,
+          aliases: true,
+        };
+
+        const selectedName = selection.fullName
+          ? person.fullName
+          : [
+              selection.firstName ? person.firstName : "",
+              selection.lastNames ? person.lastNames.join(" ") : "",
+            ]
+              .join(" ")
+              .trim();
+
+        if (!selectedName) {
+          return null;
+        }
+
+        return {
+          name: selectedName,
+          aliases: selection.aliases ? person.aliases : [],
+          summary: person.summary,
+          messageCount: person.messageCount,
+        };
+      })
+      .filter((person): person is PersonSummary => Boolean(person));
+
+    setError(null);
+
+    try {
+      const response = await fetch("/api/analyze/review/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId: chat.id,
+          title: chat.title || chat.fileName,
+          conversation: chat.text,
+          reviewedPeople,
+        }),
+      });
+
+      if (!response.ok || !response.body) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload?.error || "Failed to resume analysis after people review.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      const parseSseBlock = (block: string): StreamEvent | null => {
+        const lines = block
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean);
+
+        const eventLine = lines.find((line) => line.startsWith("event:"));
+        const dataLine = lines.find((line) => line.startsWith("data:"));
+
+        if (!eventLine || !dataLine) {
+          return null;
+        }
+
+        const event = eventLine.slice("event:".length).trim();
+        const payload = dataLine.slice("data:".length).trim();
+
+        return {
+          event,
+          data: JSON.parse(payload) as StreamPayload,
+        };
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() ?? "";
+
+        for (const block of blocks) {
+          const parsed = parseSseBlock(block);
+          if (parsed) {
+            applyStreamEvent(parsed);
+          }
+        }
+      }
+
+      const trailing = buffer.trim();
+      if (trailing) {
+        const parsed = parseSseBlock(trailing);
+        if (parsed) {
+          applyStreamEvent(parsed);
+        }
+      }
+
+      let shouldContinue = false;
+
+      setSessionChats((current) => {
+        shouldContinue = current.some((item) => {
+          if (item.id === chat.id) return false;
+          return item.status === "queued" || item.status === "error";
+        });
+        return current;
+      });
+
+      const detail = `People review saved (${reviewedPeople.length} people)`;
+
+      setStreamHistory((current) => {
+        const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        return [
+          {
+            id,
+            timestamp: Date.now(),
+            title: "Review Saved",
+            detail,
+          },
+          ...current,
+        ].slice(0, 250);
+      });
+
+      setPeopleReviewChatId("");
+      setPeopleReviewPeople([]);
+      setPeopleReviewFieldDecisions({});
+      setIsAnalyzing(false);
+      setActiveChatLabel("");
+      setActiveLayerLabel("");
+
+      if (shouldContinue) {
+        setTimeout(() => {
+          void analyzeSession();
+        }, 0);
+      } else {
+        void refreshLibraryConversations();
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Failed to resume analysis after review.");
+      setIsAnalyzing(false);
+      setActiveChatLabel("");
+      setActiveLayerLabel("");
+    }
   };
 
   async function loadConversationFromLibrary(conversationId: string) {
@@ -1219,7 +1514,11 @@ export default function Home() {
     setError(null);
     setIsAnalyzing(true);
     setStreamHistory([]);
-    promptedConflictKeysRef.current.clear();
+    promptedPeopleReviewRef.current.clear();
+    setPeopleReviewModalOpen(false);
+    setPeopleReviewChatId("");
+    setPeopleReviewPeople([]);
+    setPeopleReviewFieldDecisions({});
 
     setSessionChats((current) =>
       current.map((chat) =>
@@ -1568,11 +1867,21 @@ export default function Home() {
                   }}
                 >
                   <CardTitle>People ({unified.people.length})</CardTitle>
+                  <div className="w-full max-w-sm" onClick={(event) => event.stopPropagation()}>
+                    <input
+                      type="text"
+                      value={peopleSearchQuery}
+                      onChange={(event) => setPeopleSearchQuery(event.target.value)}
+                      placeholder="Grep people/messages (name or text)"
+                      aria-label="Search people and linked messages"
+                      className="w-full rounded-md border border-slate-300 bg-slate-50 px-3 py-2 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    />
+                  </div>
                 </CardHeader>
                 {!peopleCollapsed && <CardContent className="animate-in fade-in-50 duration-300">
                   <ScrollArea className="h-[470px] pr-3">
                     <div className="space-y-4">
-                      {unified.people.map((person) => (
+                      {filteredPeople.map(({ person, matchedMessages }) => (
                         <div key={person.name} className="animate-in fade-in-50 duration-200 space-y-2">
                           <button
                             type="button"
@@ -1586,6 +1895,9 @@ export default function Home() {
                             <p className="font-semibold">{person.name}</p>
                             <Badge variant="outline">{person.messageCount} messages</Badge>
                             <Badge variant="secondary">{person.linkedMessages.length} linked</Badge>
+                            {peopleSearchQuery.trim().length > 0 && (
+                              <Badge variant="outline">{matchedMessages.length} grep matches</Badge>
+                            )}
                           </button>
                           {person.aliases.length > 0 && (
                             <p className="text-xs text-slate-600 dark:text-slate-300">
@@ -1605,7 +1917,11 @@ export default function Home() {
                             <div className="rounded-md border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 p-2">
                               <p className="mb-2 text-xs font-semibold text-slate-600 dark:text-slate-300">Linked messages</p>
                               <div className="space-y-2">
-                                {person.linkedMessages.slice(0, 40).map((message) => (
+                                {(peopleSearchQuery.trim().length > 0
+                                  ? matchedMessages
+                                  : person.linkedMessages)
+                                  .slice(0, 80)
+                                  .map((message) => (
                                   <div key={message.id} className="text-xs">
                                     <p className="font-mono text-slate-600 dark:text-slate-300">
                                       {message.id} | {message.chat} | line {message.line}
@@ -1625,6 +1941,12 @@ export default function Home() {
 
                       {unified.people.length === 0 && (
                         <p className="text-sm text-slate-600 dark:text-slate-300">People appear after analysis starts.</p>
+                      )}
+
+                      {unified.people.length > 0 && filteredPeople.length === 0 && (
+                        <p className="text-sm text-slate-600 dark:text-slate-300">
+                          No people or linked messages matched your search.
+                        </p>
                       )}
                     </div>
                   </ScrollArea>
@@ -1857,13 +2179,13 @@ export default function Home() {
                         <p className="text-[11px] font-mono text-slate-600 dark:text-slate-300">
                           {new Date(item.timestamp).toLocaleTimeString()}
                         </p>
-                        <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">{item.event}</p>
+                        <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">{item.title}</p>
                         <p className="text-xs text-slate-600 dark:text-slate-300">{item.detail}</p>
                         {(item.chatId || item.layer) && (
                           <p className="text-[11px] text-slate-600 dark:text-slate-300">
-                            {[item.chatId ? `chat ${item.chatId}` : null, item.layer ? `layer ${item.layer}` : null]
+                            {[item.chatId ? "Chat update" : null, item.layer ? `Now in ${item.layer} layer` : null]
                               .filter(Boolean)
-                              .join(" | ")}
+                              .join(" • ")}
                           </p>
                         )}
                       </div>
@@ -1975,6 +2297,19 @@ export default function Home() {
           </div>
         </div>
       )}
+
+      <PeopleReviewModal
+        isOpen={peopleReviewModalOpen}
+        chatTitle={peopleReviewChatTitle}
+        people={peopleReviewPeople}
+        personFieldDecisions={peopleReviewFieldDecisions}
+        onPersonFieldToggle={updatePersonFieldDecision}
+        onClose={() => {
+          setPeopleReviewModalOpen(false);
+          setPeopleReviewFieldDecisions({});
+        }}
+        onConfirm={savePeopleReview}
+      />
     </div>
   );
 }
