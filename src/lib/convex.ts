@@ -8,6 +8,9 @@ export const convexFns = {
   checkConversationHashes: makeFunctionReference<"query">(
     "conversations:checkConversationHashes",
   ),
+  findPeopleByFirstNames: makeFunctionReference<"query">(
+    "conversations:findPeopleByFirstNames",
+  ),
   listConversations: makeFunctionReference<"query">(
     "conversations:listConversations",
   ),

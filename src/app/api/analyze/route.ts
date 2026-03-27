@@ -5,6 +5,25 @@ import { convexFns, getConvexAdminClient } from "@/lib/convex";
 import { sha256Hex } from "@/lib/hash";
 import { parseWhatsAppConversation } from "@/lib/whatsapp";
 
+function normalize(value: string): string {
+  return value.toLowerCase().trim();
+}
+
+function firstNameFromFullName(value: string): string {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)[0] || "";
+}
+
+function lastNamesFromFullName(value: string): string[] {
+  const parts = value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  return parts.slice(1);
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -36,6 +55,14 @@ export async function POST(request: Request) {
 
     let conversationId: string | null = null;
     let duplicate = false;
+    const peopleFirstNameConflicts: Array<{
+      firstName: string;
+      incomingName: string;
+      incomingLastNames: string[];
+      existingName: string;
+      existingLastNames: string[];
+      conversationId: string;
+    }> = [];
 
     const convex = getConvexAdminClient();
 
@@ -54,6 +81,63 @@ export async function POST(request: Request) {
           },
           { status: 409 },
         );
+      }
+
+      const firstNames = Array.from(
+        new Set(
+          analysis.people
+            .map((person) => firstNameFromFullName(person.name))
+            .map((name) => normalize(name))
+            .filter((name) => name.length > 0),
+        ),
+      );
+
+      if (firstNames.length > 0) {
+        const matches = await convex.query(convexFns.findPeopleByFirstNames, {
+          firstNames,
+        });
+
+        for (const person of analysis.people) {
+          const personFirst = normalize(firstNameFromFullName(person.name));
+          if (!personFirst) continue;
+
+          const incomingLastNames = Array.from(
+            new Set(
+              [
+                ...lastNamesFromFullName(person.name),
+                ...person.aliases.flatMap((alias) => lastNamesFromFullName(alias)),
+              ]
+                .map((lastName) => normalize(lastName))
+                .filter((lastName) => lastName.length > 0),
+            ),
+          );
+
+          for (const match of matches) {
+            if (match.firstName !== personFirst) continue;
+
+            const samePersonName = normalize(match.personName) === normalize(person.name);
+            const existingLastNames = (match.lastNames || [])
+              .map((lastName: string) => normalize(lastName))
+              .filter((lastName: string) => lastName.length > 0);
+
+            const sharesLastName = existingLastNames.some((lastName: string) =>
+              incomingLastNames.includes(lastName),
+            );
+
+            if (samePersonName || sharesLastName) {
+              continue;
+            }
+
+            peopleFirstNameConflicts.push({
+              firstName: personFirst,
+              incomingName: person.name,
+              incomingLastNames,
+              existingName: match.personName,
+              existingLastNames,
+              conversationId: match.conversationId,
+            });
+          }
+        }
       }
 
       const persisted = await convex.mutation(convexFns.saveConversationAnalysis, {
@@ -76,6 +160,7 @@ export async function POST(request: Request) {
       duplicate,
       conversationHash,
       persisted: Boolean(conversationId),
+      peopleFirstNameConflicts,
       analysis,
     });
   } catch (error) {

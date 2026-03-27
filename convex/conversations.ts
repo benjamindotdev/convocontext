@@ -37,6 +37,23 @@ function normalize(value: string): string {
   return value.toLowerCase().trim();
 }
 
+function extractNameParts(fullName: string): { firstName: string; lastNames: string[] } {
+  const tokens = fullName
+    .trim()
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+  if (tokens.length === 0) {
+    return { firstName: fullName.trim(), lastNames: [] };
+  }
+
+  return {
+    firstName: tokens[0],
+    lastNames: tokens.slice(1),
+  };
+}
+
 const EVENT_LINK_STOP_WORDS = new Set([
   "the",
   "and",
@@ -136,10 +153,29 @@ export const saveConversationAnalysis = mutation({
     const personIdsByName = new Map<string, Id<"people">>();
 
     for (const person of args.people) {
+      const allNameForms = [person.name, ...person.aliases];
+      const primaryParts = extractNameParts(person.name);
+      const lastNames = new Set<string>(
+        primaryParts.lastNames.map((lastName) => normalize(lastName)).filter((lastName) => lastName.length > 0),
+      );
+
+      for (const form of allNameForms) {
+        const parts = extractNameParts(form);
+        for (const lastName of parts.lastNames) {
+          const normalizedLastName = normalize(lastName);
+          if (normalizedLastName) {
+            lastNames.add(normalizedLastName);
+          }
+        }
+      }
+
       const personId = await ctx.db.insert("people", {
         conversationId,
         name: person.name,
         nameNormalized: normalize(person.name),
+        firstName: primaryParts.firstName,
+        firstNameNormalized: normalize(primaryParts.firstName),
+        lastNames: Array.from(lastNames),
         aliases: person.aliases,
         summary: person.summary,
         messageCount: person.messageCount,
@@ -340,6 +376,42 @@ export const checkConversationHashes = query({
     }
 
     return found;
+  },
+});
+
+export const findPeopleByFirstNames = query({
+  args: { firstNames: v.array(v.string()) },
+  handler: async (ctx, args) => {
+    const requested = Array.from(
+      new Set(args.firstNames.map((firstName) => normalize(firstName)).filter((firstName) => firstName.length > 0)),
+    );
+
+    const rows: Array<{
+      firstName: string;
+      personName: string;
+      lastNames: string[];
+      aliases: string[];
+      conversationId: string;
+    }> = [];
+
+    for (const firstName of requested) {
+      const matches = await ctx.db
+        .query("people")
+        .withIndex("by_first_name_normalized", (q) => q.eq("firstNameNormalized", firstName))
+        .take(200);
+
+      for (const person of matches) {
+        rows.push({
+          firstName,
+          personName: person.name,
+          lastNames: person.lastNames,
+          aliases: person.aliases,
+          conversationId: person.conversationId,
+        });
+      }
+    }
+
+    return rows;
   },
 });
 

@@ -20,6 +20,25 @@ type StreamChat = {
   conversation: string;
 };
 
+function normalize(value: string): string {
+  return value.toLowerCase().trim();
+}
+
+function firstNameFromFullName(value: string): string {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)[0] || "";
+}
+
+function lastNamesFromFullName(value: string): string[] {
+  const parts = value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  return parts.slice(1);
+}
+
 function toChunk(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
@@ -126,6 +145,82 @@ export async function POST(request: Request) {
                 people: peopleAcc,
                 latest: person,
               });
+            }
+
+            if (convex) {
+              const firstNames = Array.from(
+                new Set(
+                  people
+                    .map((person) => firstNameFromFullName(person.name))
+                    .map((name) => normalize(name))
+                    .filter((name) => name.length > 0),
+                ),
+              );
+
+              if (firstNames.length > 0) {
+                const matches = await convex.query(convexFns.findPeopleByFirstNames, {
+                  firstNames,
+                });
+
+                const collisions: Array<{
+                  firstName: string;
+                  incomingName: string;
+                  incomingLastNames: string[];
+                  existingName: string;
+                  existingLastNames: string[];
+                  conversationId: string;
+                }> = [];
+
+                for (const person of people) {
+                  const personFirst = normalize(firstNameFromFullName(person.name));
+                  if (!personFirst) continue;
+
+                  const incomingLastNames = Array.from(
+                    new Set(
+                      [
+                        ...lastNamesFromFullName(person.name),
+                        ...person.aliases.flatMap((alias) => lastNamesFromFullName(alias)),
+                      ]
+                        .map((lastName) => normalize(lastName))
+                        .filter((lastName) => lastName.length > 0),
+                    ),
+                  );
+
+                  for (const match of matches) {
+                    if (match.firstName !== personFirst) continue;
+
+                    const samePersonName = normalize(match.personName) === normalize(person.name);
+                    const existingLastNames = (match.lastNames || [])
+                      .map((lastName: string) => normalize(lastName))
+                      .filter((lastName: string) => lastName.length > 0);
+
+                    const sharesLastName = existingLastNames.some((lastName: string) =>
+                      incomingLastNames.includes(lastName),
+                    );
+
+                    if (samePersonName || sharesLastName) {
+                      continue;
+                    }
+
+                    collisions.push({
+                      firstName: personFirst,
+                      incomingName: person.name,
+                      incomingLastNames,
+                      existingName: match.personName,
+                      existingLastNames,
+                      conversationId: match.conversationId,
+                    });
+                  }
+                }
+
+                if (collisions.length > 0) {
+                  emit("people_first_name_conflicts", {
+                    chatId: chat.id,
+                    title,
+                    conflicts: collisions,
+                  });
+                }
+              }
             }
 
             emit("layer_done", {

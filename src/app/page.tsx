@@ -283,6 +283,14 @@ type StreamPayload = {
   people?: PersonSummary[];
   events?: EventSummary[];
   themes?: ThemeSummary[];
+  conflicts?: Array<{
+    firstName: string;
+    incomingName: string;
+    incomingLastNames: string[];
+    existingName: string;
+    existingLastNames: string[];
+    conversationId: string;
+  }>;
 };
 
 type StreamEvent = {
@@ -328,6 +336,7 @@ export default function Home() {
   const [hasMounted, setHasMounted] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const promptedConflictKeysRef = useRef<Set<string>>(new Set());
 
   const refreshLibraryConversations = async () => {
     setIsLibraryLoading(true);
@@ -385,6 +394,9 @@ export default function Home() {
     if (event === "session_started") detail = "Session started";
     if (event === "session_done") detail = "Session completed";
     if (event === "session_error") detail = `Session error: ${data.error || "Unexpected error"}`;
+    if (event === "people_first_name_conflicts") {
+      detail = `Name conflicts detected (${data.conflicts?.length ?? 0})`;
+    }
 
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -500,6 +512,35 @@ export default function Home() {
           };
         }),
       );
+      return;
+    }
+
+    if (event === "people_first_name_conflicts") {
+      const conflicts = data.conflicts || [];
+
+      for (const conflict of conflicts) {
+        const key = `${chatId}:${conflict.incomingName}:${conflict.existingName}`;
+        if (promptedConflictKeysRef.current.has(key)) {
+          continue;
+        }
+        promptedConflictKeysRef.current.add(key);
+
+        const incomingLast = conflict.incomingLastNames.join(" ") || "(none)";
+        const existingLast = conflict.existingLastNames.join(" ") || "(none)";
+
+        const samePerson = window.confirm(
+          `First-name match found for "${conflict.firstName}".\n\n` +
+            `Incoming person: ${conflict.incomingName} [${incomingLast}]\n` +
+            `Existing DB person: ${conflict.existingName} [${existingLast}]\n\n` +
+            "Are these the same person?",
+        );
+
+        if (!samePerson) {
+          setError(
+            `Keeping as separate people: ${conflict.incomingName} vs ${conflict.existingName}.`,
+          );
+        }
+      }
       return;
     }
 
@@ -1178,6 +1219,7 @@ export default function Home() {
     setError(null);
     setIsAnalyzing(true);
     setStreamHistory([]);
+    promptedConflictKeysRef.current.clear();
 
     setSessionChats((current) =>
       current.map((chat) =>
