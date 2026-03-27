@@ -1,5 +1,6 @@
 import { anthropic } from "@ai-sdk/anthropic";
 
+import { createLogger, errorMeta } from "@/lib/logger";
 import { runEventsLayer } from "@/lib/layers/events";
 import { runPeopleLayer } from "@/lib/layers/people";
 import { runThemesLayer } from "@/lib/layers/themes";
@@ -19,21 +20,37 @@ export function suggestConversationTitle(messages: ParsedMessage[]): string {
 export async function analyzeConversation(
   messages: ParsedMessage[],
 ): Promise<ConversationAnalysis> {
+  const logger = createLogger("analysis.pipeline", {
+    messageCount: messages.length,
+  });
+
   if (!process.env.ANTHROPIC_API_KEY) {
+    logger.error("missing_api_key");
     throw new Error("ANTHROPIC_API_KEY is missing. Add it to your environment.");
   }
 
   const modelName = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
   const model = anthropic(modelName);
+  logger.info("start", { modelName });
 
-  const people = await runPeopleLayer(messages, model);
-  const events = await runEventsLayer(messages, people, model);
-  const themes = await runThemesLayer(messages, events, model);
+  try {
+    const people = await runPeopleLayer(messages, model);
+    logger.info("people_done", { peopleCount: people.length });
 
-  return {
-    messages,
-    people,
-    events,
-    themes,
-  };
+    const events = await runEventsLayer(messages, people, model);
+    logger.info("events_done", { eventsCount: events.length });
+
+    const themes = await runThemesLayer(messages, events, model);
+    logger.info("themes_done", { themesCount: themes.length });
+
+    return {
+      messages,
+      people,
+      events,
+      themes,
+    };
+  } catch (error) {
+    logger.error("failed", errorMeta(error));
+    throw error;
+  }
 }

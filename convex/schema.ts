@@ -18,16 +18,20 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_conversation_and_line", ["conversationId", "line"]),
   people: defineTable({
-    conversationId: v.id("conversations"),
-    name: v.string(),
-    nameNormalized: v.string(),
+    activeConversationId: v.array(v.id("conversations")),
+    passiveConversationId: v.array(v.id("conversations")),
+    firstName: v.string(),
+    firstNameNormalized: v.string(),
+    lastNames: v.array(v.string()),
+    personKey: v.string(),
     aliases: v.array(v.string()),
     summary: v.string(),
-    messageCount: v.number(),
+    activeMessageCount: v.number(),
+    passiveMessageCount: v.number(),
     createdAt: v.number(),
   })
-    .index("by_conversation", ["conversationId"])
-    .index("by_conversation_and_name_normalized", ["conversationId", "nameNormalized"]),
+    .index("by_person_key", ["personKey"])
+    .index("by_first_name_normalized", ["firstNameNormalized"]),
   events: defineTable({
     conversationId: v.id("conversations"),
     title: v.string(),
