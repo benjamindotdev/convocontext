@@ -120,6 +120,92 @@ function parseChatTimestamp(timestamp: string | undefined): number | null {
   return Number.isNaN(fallback) ? null : fallback;
 }
 
+function firstName(value: string): string {
+  return value
+    .trim()
+    .split(/\s+/)[0]
+    ?.toLowerCase() || "";
+}
+
+function inferAddressee(message: MessageRef, participants: string[]): string {
+  const text = message.text.trim();
+  const lowered = text.toLowerCase();
+  const speakerName = message.speaker.toLowerCase();
+
+  const matches = new Set<string>();
+
+  const directStartMatch = text.match(/^([A-Za-z][A-Za-z'\-]+)\s*[,:-]/);
+  if (directStartMatch) {
+    const candidate = directStartMatch[1].toLowerCase();
+    const direct = participants.find((participant) => {
+      const p = participant.toLowerCase();
+      if (p === speakerName) return false;
+      const pFirst = firstName(participant);
+      return pFirst === candidate || p === candidate;
+    });
+    if (direct) {
+      matches.add(direct);
+    }
+  }
+
+  for (const participant of participants) {
+    const normalized = participant.toLowerCase();
+    if (normalized === speakerName) continue;
+
+    const token = firstName(participant);
+    if (!token || token.length < 3) continue;
+
+    if (lowered.includes(token)) {
+      matches.add(participant);
+    }
+  }
+
+  if (matches.size === 0) {
+    return "Group chat";
+  }
+
+  return Array.from(matches).join(", ");
+}
+
+function isDirectResponseToNext(message: MessageRef, next: MessageRef | undefined): boolean {
+  if (!next) return false;
+  if (next.speaker === message.speaker) return false;
+
+  const currentTs = parseChatTimestamp(message.timestamp);
+  const nextTs = parseChatTimestamp(next.timestamp);
+
+  if (currentTs && nextTs) {
+    const diffMs = nextTs - currentTs;
+    if (diffMs >= 0 && diffMs <= 45 * 60 * 1000) {
+      return true;
+    }
+  }
+
+  return next.line - message.line <= 8;
+}
+
+function isConversationBreak(message: MessageRef, next: MessageRef | undefined): boolean {
+  if (!next) return false;
+
+  const currentTs = parseChatTimestamp(message.timestamp);
+  const nextTs = parseChatTimestamp(next.timestamp);
+
+  if (currentTs && nextTs) {
+    const diffMs = nextTs - currentTs;
+    if (diffMs > 12 * 60 * 60 * 1000) {
+      return true;
+    }
+
+    const currentDay = new Date(currentTs).toDateString();
+    const nextDay = new Date(nextTs).toDateString();
+    if (currentDay !== nextDay && diffMs > 3 * 60 * 60 * 1000) {
+      return true;
+    }
+  }
+
+  return next.line - message.line > 120;
+}
+
 const EVENT_LINK_STOP_WORDS = new Set([
   "the",
   "and",
@@ -788,6 +874,23 @@ export default function Home() {
     return map;
   }, [sessionChats]);
 
+  const participantsByChat = useMemo(() => {
+    const map = new Map<string, string[]>();
+
+    for (const chat of sessionChats) {
+      const speakers = new Set<string>();
+
+      for (const message of chat.analysis?.messages ?? []) {
+        const name = message.speaker.trim();
+        if (name) speakers.add(name);
+      }
+
+      map.set(chat.fileName, Array.from(speakers));
+    }
+
+    return map;
+  }, [sessionChats]);
+
   const toggleSelected = (
     value: string,
     selected: string[],
@@ -814,20 +917,53 @@ export default function Home() {
       });
 
       const seen = new Set<string>();
-      const rawMessages: string[] = [];
+      const byChat = new Map<string, MessageRef[]>();
 
       for (const message of sorted) {
         if (seen.has(message.id)) continue;
         seen.add(message.id);
 
-        const raw = rawMessageById.get(message.id);
-        if (raw) {
-          rawMessages.push(raw);
+        if (!byChat.has(message.chat)) {
+          byChat.set(message.chat, []);
+        }
+        byChat.get(message.chat)!.push(message);
+      }
+
+      const chatBlocks: string[] = [];
+
+      for (const [chatName, chatMessages] of byChat) {
+        const participants = participantsByChat.get(chatName) || [];
+        const lines: string[] = [];
+
+        for (let index = 0; index < chatMessages.length; index += 1) {
+          const message = chatMessages[index];
+          const next = chatMessages[index + 1];
+          const raw = rawMessageById.get(message.id);
+
+          if (!raw) continue;
+
+          lines.push(raw);
+
+          if (!isDirectResponseToNext(message, next)) {
+            lines.push(`Addressed to: ${inferAddressee(message, participants)}`);
+          }
+
+          if (isConversationBreak(message, next)) {
+            lines.push("----------------------------------------");
+          }
+
+          if (index < chatMessages.length - 1) {
+            lines.push("");
+          }
+        }
+
+        if (lines.length > 0) {
+          chatBlocks.push(`${chatName}\n${lines.join("\n")}`);
         }
       }
 
-      if (rawMessages.length === 0) return;
-      sectionBlocks.push(`${header}\n${rawMessages.join("\n\n")}`);
+      if (chatBlocks.length === 0) return;
+      sectionBlocks.push(`${header}\n${chatBlocks.join("\n\n")}`);
     };
 
     for (const personName of selectedPeople) {
@@ -1189,6 +1325,7 @@ export default function Home() {
                   <input
                     ref={fileInputRef}
                     type="file"
+                    aria-label="Select WhatsApp chat text files"
                     accept=".txt,text/plain"
                     multiple
                     className="hidden"
@@ -1716,6 +1853,7 @@ export default function Home() {
                       <label key={person.name} className="flex items-center gap-2 text-sm">
                         <input
                           type="checkbox"
+                          aria-label={`Select person ${person.name}`}
                           checked={selectedPeople.includes(person.name)}
                           onChange={() =>
                             toggleSelected(person.name, selectedPeople, setSelectedPeople)
@@ -1736,6 +1874,7 @@ export default function Home() {
                       <label key={event.title} className="flex items-center gap-2 text-sm">
                         <input
                           type="checkbox"
+                          aria-label={`Select event ${event.title}`}
                           checked={selectedEvents.includes(event.title)}
                           onChange={() =>
                             toggleSelected(event.title, selectedEvents, setSelectedEvents)
@@ -1756,6 +1895,7 @@ export default function Home() {
                       <label key={theme.name} className="flex items-center gap-2 text-sm">
                         <input
                           type="checkbox"
+                          aria-label={`Select theme ${theme.name}`}
                           checked={selectedThemes.includes(theme.name)}
                           onChange={() =>
                             toggleSelected(theme.name, selectedThemes, setSelectedThemes)
