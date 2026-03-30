@@ -148,20 +148,7 @@ export function isConversationBreak(
 
 
 
-export function eventSignalTokens(event: {
-  title: string;
-  description: string;
-  topics: string[];
-}): string[] {
-  const raw =
-    `${event.title} ${event.description} ${event.topics.join(" ")}`.toLowerCase();
-  const words = raw
-    .split(/[^a-z0-9]+/g)
-    .map((word) => word.trim())
-    .filter((word) => word.length >= 4 && !EVENT_LINK_STOP_WORDS.has(word));
 
-  return Array.from(new Set(words));
-}
 
 export function prettyStatus(status: ChatStatus): string {
   if (status === "queued") return "Queued";
