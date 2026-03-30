@@ -6,6 +6,21 @@ import { runPeopleLayer } from "@/lib/layers/people";
 import { runThemesLayer } from "@/lib/layers/themes";
 import { ConversationAnalysis, ParsedMessage } from "@/lib/types";
 
+type AnalyzeContext = {
+  existingEvents?: Array<{
+    title: string;
+    description: string;
+    participants: string[];
+    topics: string[];
+  }>;
+  existingThemes?: Array<{
+    name: string;
+    description: string;
+    keywords: string[];
+    eventTitles: string[];
+  }>;
+};
+
 export function suggestConversationTitle(messages: ParsedMessage[]): string {
   const participants = Array.from(new Set(messages.map((m) => m.speaker))).slice(0, 2);
   const stamp = new Date().toISOString().slice(0, 10);
@@ -19,9 +34,15 @@ export function suggestConversationTitle(messages: ParsedMessage[]): string {
 
 export async function analyzeConversation(
   messages: ParsedMessage[],
+  context?: AnalyzeContext,
 ): Promise<ConversationAnalysis> {
+  const existingEvents = context?.existingEvents || [];
+  const existingThemes = context?.existingThemes || [];
+
   const logger = createLogger("analysis.pipeline", {
     messageCount: messages.length,
+    existingEvents: existingEvents.length,
+    existingThemes: existingThemes.length,
   });
 
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -37,10 +58,14 @@ export async function analyzeConversation(
     const people = await runPeopleLayer(messages, model);
     logger.info("people_done", { peopleCount: people.length });
 
-    const events = await runEventsLayer(messages, people, model);
+    const events = await runEventsLayer(messages, people, model, {
+      existingEvents,
+    });
     logger.info("events_done", { eventsCount: events.length });
 
-    const themes = await runThemesLayer(messages, events, model);
+    const themes = await runThemesLayer(messages, events, model, undefined, {
+      existingThemes,
+    });
     logger.info("themes_done", { themesCount: themes.length });
 
     return {

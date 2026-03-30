@@ -1,19 +1,14 @@
+import { sha256Hex , parseWhatsAppConversation } from "@/lib/utils";
 import { NextResponse } from "next/server";
 import { anthropic } from "@ai-sdk/anthropic";
 
 import { suggestConversationTitle } from "@/lib/analysis";
 import { convexFns, getConvexAdminClient } from "@/lib/convex";
-import { runEventsLayer } from "@/lib/layers/events";
 import { runPeopleLayer } from "@/lib/layers/people";
-import { runThemesLayer } from "@/lib/layers/themes";
-import { sha256Hex } from "@/lib/hash";
-import { createLogger, errorMeta } from "@/lib/logger";
-import type {
-  EventSummary,
-  PersonSummary,
-  ThemeSummary,
-} from "@/lib/types";
-import { parseWhatsAppConversation } from "@/lib/whatsapp";
+
+import { createLogger } from "@/lib/logger";
+import type { PersonSummary } from "@/lib/types";
+
 
 type StreamChat = {
   id: string;
@@ -21,35 +16,91 @@ type StreamChat = {
   conversation: string;
 };
 
+// ... include all the identity match helpers from original stream block
+
 function normalize(value: string): string {
   return value.toLowerCase().trim();
 }
 
 function firstNameFromFullName(value: string): string {
-  return value
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)[0] || "";
+  return value.trim().split(/\s+/).filter(Boolean)[0] || "";
 }
 
 function lastNamesFromFullName(value: string): string[] {
-  const parts = value
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  return parts.slice(1);
+  return value.trim().split(/\s+/).filter(Boolean).slice(1);
 }
 
 function splitNameParts(value: string): { firstName: string; lastNames: string[] } {
-  const parts = value
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+  const parts = value.trim().split(/\s+/).filter(Boolean);
+  return { firstName: parts[0] || "", lastNames: parts.slice(1) };
+}
 
-  return {
-    firstName: parts[0] || "",
-    lastNames: parts.slice(1),
-  };
+const NICKNAME_GROUPS = [
+  ["ben", "benjamin", "benny"], ["stacy", "stacey"], ["mike", "michael"],
+  ["alex", "alexander", "alexandra"], ["sam", "samuel", "samantha"],
+  ["liz", "elizabeth", "beth", "lizzy"], ["jon", "john", "johnny"],
+  ["kate", "katherine", "kathryn", "katie"], ["matt", "matthew"],
+  ["chris", "christopher", "christina"], ["rob", "robert", "bobby"],
+  ["will", "william", "bill", "billy"]
+] as const;
+
+const nicknameLookup = new Map<string, Set<string>>();
+for (const group of NICKNAME_GROUPS) {
+  for (const name of group) {
+    const key = normalize(name);
+    const current = nicknameLookup.get(key) ?? new Set<string>();
+    for (const item of group) current.add(normalize(item));
+    nicknameLookup.set(key, current);
+  }
+}
+
+function expandFirstNameCandidates(value: string): string[] {
+  const n = normalize(value);
+  if (!n) return [];
+  const expanded = new Set([n, ...(nicknameLookup.get(n) || [])]);
+  return Array.from(expanded);
+}
+
+function namesAreRelated(left: string, right: string): boolean {
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (left.length >= 3 && right.startsWith(left)) return true;
+  if (right.length >= 3 && left.startsWith(right)) return true;
+  return false;
+}
+
+function scoreIdentityCandidate(
+  incoming: PersonSummary,
+  existing: { personName: string; lastNames: string[]; aliases: string[] }
+): number {
+  const incomingName = normalize(incoming.name);
+  const existingName = normalize(existing.personName);
+  if (!incomingName || !existingName || incomingName === existingName) return -1;
+
+  const inParts = splitNameParts(incoming.name);
+  const exParts = splitNameParts(existing.personName);
+  const inFirst = normalize(inParts.firstName);
+  const exFirst = normalize(exParts.firstName);
+
+  if (inFirst && exFirst && inFirst === exFirst) return 100;
+
+  const inFirstExp = expandFirstNameCandidates(inFirst);
+  const exFirstExp = expandFirstNameCandidates(exFirst);
+  if (!inFirstExp.some(c => exFirstExp.some(o => namesAreRelated(c, o)))) return -1;
+
+  const inLasts = new Set([...inParts.lastNames, ...incoming.aliases.flatMap((a) => splitNameParts(a).lastNames)].map(normalize).filter(Boolean));
+  const exLasts = new Set([...exParts.lastNames, ...(existing.lastNames || [])].map(normalize).filter(Boolean));
+  const lastNameOverlap = Array.from(inLasts).some((p) => exLasts.has(p));
+
+  const inAlias = new Set([incoming.name, ...incoming.aliases].map(normalize).filter(Boolean));
+  const exAlias = new Set([existing.personName, ...(existing.aliases || [])].map(normalize).filter(Boolean));
+  const aliasOverlap = Array.from(inAlias).some(a => exAlias.has(a));
+
+  let score = inFirst === exFirst ? 2 : 1;
+  if (lastNameOverlap) score += 3;
+  else if (inLasts.size === 0 || exLasts.size === 0) score += 1;
+  if (aliasOverlap) score += 2;
+  return score;
 }
 
 function toChunk(event: string, data: unknown): string {
@@ -64,391 +115,127 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     chats = Array.isArray(body?.chats) ? body.chats : [];
-    logger.info("request_received", { chatCount: chats.length });
   } catch {
-    logger.warn("invalid_json_body");
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  if (chats.length === 0) {
-    logger.warn("empty_chat_array");
-    return NextResponse.json({ error: "At least one chat is required." }, { status: 400 });
-  }
+  if (chats.length === 0) return NextResponse.json({ error: "At least one chat is required." }, { status: 400 });
 
   const encoder = new TextEncoder();
-
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      const emit = (event: string, data: unknown) => {
-        controller.enqueue(encoder.encode(toChunk(event, data)));
-      };
+      const emit = (event: string, data: unknown) => controller.enqueue(encoder.encode(toChunk(event, data)));
 
       const run = async () => {
         const convex = getConvexAdminClient();
         const modelName = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
         const model = anthropic(modelName);
 
-        logger.info("session_started", {
-          totalChats: chats.length,
-          modelName,
-          convexConfigured: Boolean(convex),
-        });
+        emit("session_started", { totalChats: chats.length, startedAt: Date.now() });
+        const allExtractedPeople: PersonSummary[] = [];
+        const uniqueLinks = new Map<string, { incomingName: string; existingName: string }>();
+        const sessionConversationIds: { id: string, conversationId: string }[] = [];
 
-        emit("session_started", {
-          totalChats: chats.length,
-          startedAt: Date.now(),
-        });
+        for (const chat of chats) {
+          const raw = String(chat.conversation ?? "").trim();
+          if (!raw) { emit("chat_error", { chatId: chat.id, error: "Empty conversation." }); continue; }
+          const parsed = parseWhatsAppConversation(raw);
+          if (parsed.length === 0) { emit("chat_error", { chatId: chat.id, error: "No messages." }); continue; }
 
-        for (const [index, chat] of chats.entries()) {
-          const chatLogger = logger.child({
-            chatId: chat.id,
-            chatIndex: index,
-          });
-          const rawConversation = String(chat.conversation ?? "").trim();
-          const providedTitle = String(chat.title ?? "").trim();
-
-          chatLogger.info("chat_received", {
-            rawChars: rawConversation.length,
-            titleProvided: providedTitle.length > 0,
-          });
-
-          if (!rawConversation) {
-            chatLogger.warn("chat_empty_conversation");
-            emit("chat_error", {
-              chatId: chat.id,
-              error: "Conversation text is required.",
-            });
-            continue;
-          }
-
-          const parsed = parseWhatsAppConversation(rawConversation);
-          chatLogger.info("chat_parsed", { messageCount: parsed.length });
-
-          if (parsed.length === 0) {
-            chatLogger.warn("chat_parse_failed_zero_messages");
-            emit("chat_error", {
-              chatId: chat.id,
-              error:
-                "No WhatsApp messages could be parsed. Use exported lines like '12/24/2025, 9:00 PM - Name: message'.",
-            });
-            continue;
-          }
-
-          const title = providedTitle || suggestConversationTitle(parsed);
-          const conversationHash = await sha256Hex(rawConversation);
-          chatLogger.info("chat_prepared", { title });
-
+          const title = String(chat.title ?? "").trim() || suggestConversationTitle(parsed);
+          const hash = await sha256Hex(raw);
+          
           if (convex) {
-            const existing = await convex.query(convexFns.checkConversationHashes, {
-              hashes: [conversationHash],
-            });
-
+            const existing = await convex.query(convexFns.checkConversationHashes, { hashes: [hash] });
             if (existing.length > 0) {
-              chatLogger.info("chat_duplicate_detected", {
-                existingConversationId: existing[0].conversationId,
-              });
-              emit("chat_duplicate", {
-                chatId: chat.id,
-                title,
-                conversationHash,
-                conversationId: existing[0].conversationId,
-                existingTitle: existing[0].title,
-                error: "This conversation has already been analyzed.",
-              });
+              emit("chat_duplicate", { chatId: chat.id, title, conversationId: existing[0].conversationId, error: "Already analyzed." });
               continue;
             }
           }
 
-          emit("chat_started", {
-            chatId: chat.id,
-            chatIndex: index,
-            title,
-            fileName: providedTitle || title,
-            conversationHash,
-            messages: parsed,
-          });
-
-          try {
-            emit("layer_started", {
-              chatId: chat.id,
-              layer: "people",
+          emit("layer_started", { chatId: chat.id, layer: "people" });
+          const people = await runPeopleLayer(parsed, model);
+          allExtractedPeople.push(...people);
+          
+          let conversationId = "NO_ID";
+          if (convex) {
+            const res = await convex.mutation(convexFns.savePhase1Draft, {
+              title,
+              rawText: raw,
+              conversationHash: hash,
+              messages: parsed,
+              people
             });
-            chatLogger.info("layer_started", { layer: "people" });
-
-            const people = await runPeopleLayer(parsed, model);
-            chatLogger.info("layer_complete", { layer: "people", count: people.length });
-
-            // Stream people incrementally.
-            const peopleAcc: PersonSummary[] = [];
-            for (const person of people) {
-              peopleAcc.push(person);
-              emit("people_delta", {
-                chatId: chat.id,
-                people: peopleAcc,
-                latest: person,
-              });
+            if (res.duplicate) {
+              emit("chat_duplicate", { chatId: chat.id, title, conversationId: res.conversationId, error: "Already analyzed." });
+              continue;
             }
+            conversationId = res.conversationId as string;
+            sessionConversationIds.push({ id: chat.id, conversationId });
+          }
+          
+          emit("people_delta", { chatId: chat.id, people });
+          emit("layer_done", { chatId: chat.id, layer: "people", count: people.length });
+        }
 
-            const uniqueLinks = new Map<string, { incomingName: string; existingName: string }>();
-
-            if (convex) {
-              const firstNames = Array.from(
-                new Set(
-                  people
-                    .map((person) => firstNameFromFullName(person.name))
-                    .map((name) => normalize(name))
-                    .filter((name) => name.length > 0),
-                ),
-              );
-
-              if (firstNames.length > 0) {
-                const matches = await convex.query(convexFns.findPeopleByFirstNames, {
-                  firstNames,
-                });
-
-                const collisions: Array<{
-                  firstName: string;
-                  incomingName: string;
-                  incomingLastNames: string[];
-                  existingName: string;
-                  existingLastNames: string[];
-                  activeConversationId: string[];
-                  passiveConversationId: string[];
-                }> = [];
-
-                for (const person of people) {
-                  const personFirst = normalize(firstNameFromFullName(person.name));
-                  if (!personFirst) continue;
-
-                  const incomingLastNames = Array.from(
-                    new Set(
-                      [
-                        ...lastNamesFromFullName(person.name),
-                        ...person.aliases.flatMap((alias) => lastNamesFromFullName(alias)),
-                      ]
-                        .map((lastName) => normalize(lastName))
-                        .filter((lastName) => lastName.length > 0),
-                    ),
-                  );
-
-                  for (const match of matches) {
-                    if (match.firstName !== personFirst) continue;
-
-                    const samePersonName = normalize(match.personName) === normalize(person.name);
-                    const existingLastNames = (match.lastNames || [])
-                      .map((lastName: string) => normalize(lastName))
-                      .filter((lastName: string) => lastName.length > 0);
-
-                    const sharesLastName = existingLastNames.some((lastName: string) =>
-                      incomingLastNames.includes(lastName),
-                    );
-
-                    if (samePersonName || sharesLastName) {
-                      continue;
-                    }
-
-                    collisions.push({
-                      firstName: personFirst,
-                      incomingName: person.name,
-                      incomingLastNames,
-                      existingName: match.personName,
-                      existingLastNames,
-                      activeConversationId: match.activeConversationId || [],
-                      passiveConversationId: match.passiveConversationId || [],
-                    });
-                  }
+        // Global Link Resolution
+        if (convex && allExtractedPeople.length > 0) {
+          const firstNames = Array.from(new Set(allExtractedPeople.map(p => normalize(firstNameFromFullName(p.name))).filter(Boolean)));
+          if (firstNames.length > 0) {
+            const matches = await convex.query(convexFns.findPeopleByFirstNames, { firstNames });
+            for (const person of allExtractedPeople) {
+              let bestTarget: typeof matches[0] | null = null;
+              let bestScore = -1;
+              for (const match of matches) {
+                const score = scoreIdentityCandidate(person, match);
+                if (score > 3 && score > bestScore) {
+                  bestScore = score;
+                  bestTarget = match;
                 }
-
-                for (const conflict of collisions) {
-                  const key = `${normalize(conflict.incomingName)}::${normalize(conflict.existingName)}`;
-                  if (!uniqueLinks.has(key)) {
-                    uniqueLinks.set(key, {
-                      incomingName: conflict.incomingName,
-                      existingName: conflict.existingName,
-                    });
-                  }
+              }
+              if (bestTarget) {
+                const k = `${normalize(person.name)}|${normalize(bestTarget.personName)}`;
+                if (!uniqueLinks.has(k)) {
+                  uniqueLinks.set(k, { incomingName: person.name, existingName: bestTarget.personName });
                 }
-
               }
             }
-
-            emit("people_review_prompt", {
-              chatId: chat.id,
-              title,
-              reviewPeople: people.map((person) => {
-                const parts = splitNameParts(person.name);
-                return {
-                  fullName: person.name,
-                  firstName: parts.firstName,
-                  lastNames: parts.lastNames,
-                  aliases: person.aliases,
-                  summary: person.summary,
-                  messageCount: person.messageCount,
-                };
-              }),
-              potentialLinks: Array.from(uniqueLinks.values()),
-            });
-
-            emit("chat_paused_review", {
-              chatId: chat.id,
-              title,
-              conversationHash,
-              messages: parsed,
-              people,
-              pendingReason: "awaiting_people_review",
-            });
-
-            emit("session_paused_review", {
-              chatId: chat.id,
-              title,
-              pausedAt: Date.now(),
-              pendingReason: "awaiting_people_review",
-            });
-
-            chatLogger.info("chat_paused_for_review", {
-              peopleCount: people.length,
-              potentialLinks: uniqueLinks.size,
-            });
-
-            controller.close();
-            return;
-
-            emit("layer_done", {
-              chatId: chat.id,
-              layer: "people",
-              count: people.length,
-            });
-
-            emit("layer_started", {
-              chatId: chat.id,
-              layer: "events",
-            });
-            chatLogger.info("layer_started", { layer: "events" });
-
-            const events = await runEventsLayer(parsed, people, model);
-            chatLogger.info("layer_complete", { layer: "events", count: events.length });
-
-            // Stream events incrementally.
-            const eventsAcc: EventSummary[] = [];
-            for (const event of events) {
-              eventsAcc.push(event);
-              emit("events_delta", {
-                chatId: chat.id,
-                events: eventsAcc,
-                latest: event,
-              });
-            }
-
-            emit("layer_done", {
-              chatId: chat.id,
-              layer: "events",
-              count: events.length,
-            });
-
-            emit("layer_started", {
-              chatId: chat.id,
-              layer: "themes",
-            });
-            chatLogger.info("layer_started", { layer: "themes" });
-
-            let latestThemes: ThemeSummary[] = [];
-            const themes = await runThemesLayer(parsed, events, model, (progressThemes) => {
-              latestThemes = progressThemes;
-              emit("themes_delta", {
-                chatId: chat.id,
-                themes: latestThemes,
-                latest: latestThemes[latestThemes.length - 1] ?? null,
-              });
-            });
-
-            // Fallback emit in case no per-topic updates were produced.
-            if (latestThemes.length === 0) {
-              emit("themes_delta", {
-                chatId: chat.id,
-                themes,
-                latest: themes[themes.length - 1] ?? null,
-              });
-            }
-
-            emit("layer_done", {
-              chatId: chat.id,
-              layer: "themes",
-              count: themes.length,
-            });
-            chatLogger.info("layer_complete", { layer: "themes", count: themes.length });
-
-            const analysis = {
-              messages: parsed,
-              people,
-              events,
-              themes,
-            };
-
-            let conversationId: string | null = null;
-            let duplicate = false;
-            if (convex) {
-              const persisted = await convex.mutation(convexFns.saveConversationAnalysis, {
-                title,
-                rawText: rawConversation,
-                conversationHash,
-                messages: analysis.messages,
-                people: analysis.people,
-                events: analysis.events,
-                themes: analysis.themes,
-              });
-              conversationId = persisted.conversationId;
-              duplicate = persisted.duplicate;
-              chatLogger.info("persist_complete", {
-                conversationId,
-                duplicate,
-              });
-            } else {
-              chatLogger.warn("convex_not_configured");
-            }
-
-            emit("chat_done", {
-              chatId: chat.id,
-              title,
-              conversationHash,
-              duplicate,
-              conversationId,
-              persisted: Boolean(conversationId),
-              analysis,
-            });
-          } catch (error) {
-            chatLogger.error("chat_failed", {
-              ...errorMeta(error),
-            });
-            emit("chat_error", {
-              chatId: chat.id,
-              error: error instanceof Error ? error.message : "Unexpected error",
-            });
           }
         }
 
-        emit("session_done", { completedAt: Date.now() });
-        logger.info("session_done", { totalChats: chats.length });
+        // Group the globally extracted people so the modal is clean.
+        const consolidated = Array.from(
+          allExtractedPeople.reduce((acc, p) => {
+             const key = normalize(p.name);
+             if (!acc.has(key)) acc.set(key, {...p});
+             else acc.get(key)!.messageCount += p.messageCount; // simplistic aggregation
+             return acc;
+          }, new Map<string, PersonSummary>()).values()
+        );
+
+        emit("people_review_prompt", {
+           reviewPeople: consolidated.map(p => {
+             const parts = splitNameParts(p.name);
+             return { fullName: p.name, firstName: parts.firstName, lastNames: parts.lastNames, aliases: p.aliases, summary: p.summary, messageCount: p.messageCount };
+           }),
+           potentialLinks: Array.from(uniqueLinks.values()),
+           draftChats: sessionConversationIds
+        });
+
+        emit("session_paused_review", {
+           pausedAt: Date.now(),
+           pendingReason: "awaiting_global_people_review"
+        });
+
         controller.close();
       };
-
-      run().catch((error) => {
-        logger.error("session_failed", {
-          ...errorMeta(error),
-        });
-        emit("session_error", {
-          error: error instanceof Error ? error.message : "Unexpected error",
-        });
+      run().catch((err) => {
+        logger.error("stream_error", { error: err.stack });
+        emit("session_error", { error: err.message });
         controller.close();
       });
-    },
+    }
   });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no",
-    },
-  });
+  return new NextResponse(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" } });
 }

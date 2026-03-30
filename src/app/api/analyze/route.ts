@@ -1,10 +1,11 @@
+import { sha256Hex , parseWhatsAppConversation } from "@/lib/utils";
 import { NextResponse } from "next/server";
 
 import { analyzeConversation, suggestConversationTitle } from "@/lib/analysis";
 import { convexFns, getConvexAdminClient } from "@/lib/convex";
-import { sha256Hex } from "@/lib/hash";
+
 import { createLogger, errorMeta } from "@/lib/logger";
-import { parseWhatsAppConversation } from "@/lib/whatsapp";
+
 
 function normalize(value: string): string {
   return value.toLowerCase().trim();

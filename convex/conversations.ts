@@ -69,6 +69,57 @@ function makePersonKey(firstName: string, lastNames: string[]): string {
   return `${first}|${lasts.join("|")}`;
 }
 
+function normalizedLastNameSet(values: string[]): Set<string> {
+  const stopWords = new Set([
+    "and",
+    "in",
+    "on",
+    "at",
+    "the",
+    "a",
+    "an",
+    "of",
+  ]);
+
+  return new Set(
+    values
+      .flatMap((value) =>
+        value
+          .split(/[^a-zA-Z0-9]+/g)
+          .map((part) => normalize(part)),
+      )
+      .filter((value) => value.length >= 3)
+      .filter((value) => !stopWords.has(value)),
+  );
+}
+
+function isSubset(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) {
+    if (!right.has(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function areLastNamesCompatible(left: Set<string>, right: Set<string>): boolean {
+  if (left.size === 0 || right.size === 0) {
+    return true;
+  }
+
+  if (isSubset(left, right) || isSubset(right, left)) {
+    return true;
+  }
+
+  for (const value of left) {
+    if (right.has(value)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function displayName(firstName: string, lastNames: string[]): string {
   return [firstName, ...lastNames].filter(Boolean).join(" ").trim();
 }
@@ -105,6 +156,24 @@ function mergeSummary(existing: string, incoming: string): string {
   if (right.includes(left)) return right;
 
   return `${left}\n\n${right}`;
+}
+
+function mergeUniqueStrings(...lists: string[][]): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+
+  for (const list of lists) {
+    for (const value of list) {
+      const trimmed = value.trim();
+      if (!trimmed) continue;
+      const key = normalize(trimmed);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(trimmed);
+    }
+  }
+
+  return merged;
 }
 
 const EVENT_LINK_STOP_WORDS = new Set([
@@ -151,26 +220,20 @@ function eventSignalTokens(event: {
   return Array.from(new Set(words));
 }
 
-export const saveConversationAnalysis = mutation({
+export const savePhase1Draft = mutation({
   args: {
     title: v.string(),
     rawText: v.string(),
     conversationHash: v.string(),
     messages: v.array(messageValidator),
-    people: v.array(personValidator),
-    events: v.array(eventValidator),
-    themes: v.array(themeValidator),
-    identityLinks: v.optional(v.array(identityLinkValidator)),
+    people: v.array(personValidator)
   },
   handler: async (ctx, args) => {
-    logConvex("info", "save_start", {
+    logConvex("info", "save_draft_start", {
       title: args.title,
       rawChars: args.rawText.length,
       messageCount: args.messages.length,
       peopleCount: args.people.length,
-      identityLinksCount: args.identityLinks?.length || 0,
-      eventsCount: args.events.length,
-      themesCount: args.themes.length,
     });
 
     const existing = await ctx.db
@@ -181,7 +244,7 @@ export const saveConversationAnalysis = mutation({
       .unique();
 
     if (existing) {
-      logConvex("info", "save_duplicate", { conversationId: existing._id });
+      logConvex("info", "save_draft_duplicate", { conversationId: existing._id });
       return {
         conversationId: existing._id,
         duplicate: true,
@@ -194,14 +257,14 @@ export const saveConversationAnalysis = mutation({
       title: args.title,
       rawText: args.rawText,
       conversationHash: args.conversationHash,
+      status: "phase1_draft",
+      draftPeople: args.people,
       createdAt: now,
       analyzedAt: now,
     });
 
-    const messageIdsByLine = new Map<number, Id<"messages">>();
-
     for (const message of args.messages) {
-      const messageId = await ctx.db.insert("messages", {
+      await ctx.db.insert("messages", {
         conversationId,
         line: message.line,
         speaker: message.speaker,
@@ -209,11 +272,31 @@ export const saveConversationAnalysis = mutation({
         timestamp: message.timestamp,
         createdAt: now,
       });
-
-      if (!messageIdsByLine.has(message.line)) {
-        messageIdsByLine.set(message.line, messageId);
-      }
     }
+
+    logConvex("info", "save_draft_done", { conversationId });
+
+    return {
+      conversationId,
+      duplicate: false,
+    };
+  },
+});
+
+export const commitGlobalIdentities = mutation({
+  args: {
+    conversationId: v.id("conversations"),
+    people: v.array(personValidator),
+    identityLinks: v.optional(v.array(identityLinkValidator)),
+  },
+  handler: async (ctx, args) => {
+    const { conversationId } = args;
+    const now = Date.now();
+
+    const messages = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation_and_line", (q) => q.eq("conversationId", conversationId))
+      .collect();
 
     const personIdsByName = new Map<string, Id<"people">>();
     const incomingToExistingName = new Map<string, string>();
@@ -244,9 +327,93 @@ export const saveConversationAnalysis = mutation({
         if (candidateDisplay === displayNameNormalized) {
           return candidate;
         }
+
+        const aliasMatched = (candidate.aliases || []).some(
+          (alias) => normalize(alias) === displayNameNormalized,
+        );
+        if (aliasMatched) {
+          return candidate;
+        }
       }
 
       return null;
+    };
+
+    const resolveLinkedExistingNameForPerson = (person: {
+      name: string;
+      aliases: string[];
+    }): string | undefined => {
+      const personFirst = normalize(extractNameParts(person.name).firstName);
+      const candidates = [person.name, ...person.aliases, personFirst]
+        .map((value) => normalize(value))
+        .filter((value) => value.length > 0);
+
+      for (const candidate of candidates) {
+        const linked = incomingToExistingName.get(candidate);
+        if (linked) {
+          return linked;
+        }
+      }
+
+      return undefined;
+    };
+
+    const findCompatiblePersonByFirstName = async (person: {
+      name: string;
+      aliases: string[];
+    }): Promise<Doc<"people"> | null> => {
+      const initialParts = extractNameParts(person.name);
+      const firstNameNormalized = normalize(initialParts.firstName);
+      if (!firstNameNormalized) return null;
+
+      const incomingLastNames = normalizedLastNameSet([
+        ...initialParts.lastNames,
+        ...person.aliases.flatMap((alias) => extractNameParts(alias).lastNames),
+      ]);
+
+      const incomingNames = new Set(
+        [person.name, ...person.aliases]
+          .map((name) => normalize(name))
+          .filter((name) => name.length > 0),
+      );
+
+      const candidates = await ctx.db
+        .query("people")
+        .withIndex("by_first_name_normalized", (q) => q.eq("firstNameNormalized", firstNameNormalized))
+        .take(200);
+
+      let best: { person: Doc<"people">; score: number } | null = null;
+
+      for (const candidate of candidates) {
+        const candidateDisplay = displayName(candidate.firstName, candidate.lastNames);
+        const candidateDisplayNormalized = normalize(candidateDisplay);
+        if (candidateDisplayNormalized === normalize(person.name)) {
+          return candidate;
+        }
+
+        const candidateLastNames = normalizedLastNameSet(candidate.lastNames);
+        if (!areLastNamesCompatible(incomingLastNames, candidateLastNames)) {
+          continue;
+        }
+
+        let score = 0;
+        if (incomingLastNames.size > 0 && candidateLastNames.size > 0) {
+          score += 3;
+        } else {
+          score += 1;
+        }
+
+        const aliasOverlap = (candidate.aliases || []).some((alias) => incomingNames.has(normalize(alias)));
+        if (aliasOverlap || incomingNames.has(candidateDisplayNormalized)) {
+          score += 2;
+        }
+
+        if (!best || score > best.score) {
+          best = { person: candidate, score };
+        }
+      }
+
+      return best?.person ?? null;
     };
 
     for (const person of args.people) {
@@ -262,12 +429,15 @@ export const saveConversationAnalysis = mutation({
         .withIndex("by_person_key", (q) => q.eq("personKey", personKey))
         .unique();
 
-      const linkedExistingName = incomingToExistingName.get(personNameNormalized);
+      const linkedExistingName = resolveLinkedExistingNameForPerson(person);
       const linkedExistingPerson = linkedExistingName
         ? await findPersonByDisplayName(linkedExistingName)
         : null;
+      const firstNameCompatiblePerson = !linkedExistingPerson && !existingPerson
+        ? await findCompatiblePersonByFirstName(person)
+        : null;
 
-      const resolvedExistingPerson = linkedExistingPerson || existingPerson;
+      const resolvedExistingPerson = linkedExistingPerson || existingPerson || firstNameCompatiblePerson;
 
       if (linkedExistingName && !linkedExistingPerson) {
         logConvex("warn", "identity_link_target_not_found", {
@@ -285,6 +455,18 @@ export const saveConversationAnalysis = mutation({
           incomingName: person.name,
           linkedPersonId: linkedExistingPerson._id,
           personKeyMatchedId: existingPerson._id,
+        });
+      }
+
+      if (
+        firstNameCompatiblePerson &&
+        !linkedExistingPerson &&
+        !existingPerson
+      ) {
+        logConvex("info", "first_name_compatibility_match_applied", {
+          incomingName: person.name,
+          matchedPersonId: firstNameCompatiblePerson._id,
+          matchedDisplayName: displayName(firstNameCompatiblePerson.firstName, firstNameCompatiblePerson.lastNames),
         });
       }
 
@@ -327,7 +509,7 @@ export const saveConversationAnalysis = mutation({
 
       let speakerMatchCount = 0;
       let mentionOnlyMatchCount = 0;
-      for (const message of args.messages) {
+      for (const message of messages) {
         const speaker = normalize(message.speaker);
         const text = message.text.toLowerCase();
         const speakerMatch = tokens.includes(speaker);
@@ -390,26 +572,104 @@ export const saveConversationAnalysis = mutation({
       personIdsByName.set(personNameNormalized, personId);
     }
 
+    const personLinkSet = new Set<string>();
+
+    for (const person of args.people) {
+      const personId = personIdsByName.get(normalize(person.name));
+      if (!personId) continue;
+
+      const tokens = [person.name, ...person.aliases]
+        .map(normalize)
+        .filter((token) => token.length > 1);
+
+      for (const message of messages) {
+        const speaker = normalize(message.speaker);
+        const text = message.text.toLowerCase();
+        const speakerMatch = tokens.includes(speaker);
+        const textMatch = tokens.some((token) => token.length > 2 && text.includes(token));
+
+        if (!speakerMatch && !textMatch) {
+          continue;
+        }
+
+        const key = `${message._id}:${personId}`;
+        if (personLinkSet.has(key)) continue;
+        personLinkSet.add(key);
+
+        await ctx.db.insert("messagePeople", {
+          conversationId,
+          messageId: message._id,
+          personId,
+          createdAt: now,
+        });
+      }
+    }
+
+    logConvex("info", "commit_identities_done", { conversationId });
+  },
+});
+
+export const savePhase3Analysis = mutation({
+  args: {
+    conversationId: v.id("conversations"),
+    events: v.array(eventValidator),
+    themes: v.array(themeValidator),
+  },
+  handler: async (ctx, args) => {
+    const { conversationId } = args;
+    const now = Date.now();
+
+    const messages = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation_and_line", (q) => q.eq("conversationId", conversationId))
+      .collect();
+
+    const messageIdsByLine = new Map<number, Id<"messages">>();
+    for (const m of messages) {
+      messageIdsByLine.set(m.line, m._id);
+    }
+
     const eventIdsByTitle = new Map<string, Id<"events">>();
     const eventMessageIds = new Map<string, Set<Id<"messages">>>();
 
     for (const event of args.events) {
       const eventKey = normalize(event.title);
-      const eventId = await ctx.db.insert("events", {
-        conversationId,
-        title: event.title,
-        titleNormalized: eventKey,
-        description: event.description,
-        participants: event.participants,
-        timeframe: event.timeframe,
-        evidenceLines: event.evidenceLines,
-        topics: event.topics,
-        createdAt: now,
-      });
+      const existingGlobalEvents = await ctx.db
+        .query("events")
+        .withIndex("by_title_normalized", (q) => q.eq("titleNormalized", eventKey))
+        .take(1);
+
+      let eventId: Id<"events">;
+
+      if (existingGlobalEvents.length > 0) {
+        const existingEvent = existingGlobalEvents[0];
+
+        await ctx.db.patch(existingEvent._id, {
+          description: mergeSummary(existingEvent.description, event.description),
+          participants: mergeUniqueStrings(existingEvent.participants, event.participants),
+          topics: mergeUniqueStrings(existingEvent.topics, event.topics),
+          timeframe: mergeSummary(existingEvent.timeframe, event.timeframe),
+          evidenceLines: Array.from(new Set([...existingEvent.evidenceLines, ...event.evidenceLines])),
+        });
+
+        eventId = existingEvent._id;
+      } else {
+        eventId = await ctx.db.insert("events", {
+          conversationId,
+          title: event.title,
+          titleNormalized: eventKey,
+          description: event.description,
+          participants: event.participants,
+          timeframe: event.timeframe,
+          evidenceLines: event.evidenceLines,
+          topics: event.topics,
+          createdAt: now,
+        });
+      }
 
       eventIdsByTitle.set(eventKey, eventId);
 
-      const linkedMessageIds = new Set<Id<"messages">>();
+      const linkedMessageIds = eventMessageIds.get(eventKey) || new Set<Id<"messages">>();
       for (const line of event.evidenceLines) {
         const messageId = messageIdsByLine.get(line);
         if (messageId) linkedMessageIds.add(messageId);
@@ -418,15 +678,12 @@ export const saveConversationAnalysis = mutation({
       if (linkedMessageIds.size === 0) {
         const signalTokens = eventSignalTokens(event);
 
-        for (const message of args.messages) {
-          const messageId = messageIdsByLine.get(message.line);
-          if (!messageId) continue;
-
+        for (const message of messages) {
           const text = message.text.toLowerCase();
           const matchesSignal = signalTokens.some((token) => text.includes(token));
 
           if (matchesSignal) {
-            linkedMessageIds.add(messageId);
+            linkedMessageIds.add(message._id);
           }
         }
       }
@@ -438,63 +695,47 @@ export const saveConversationAnalysis = mutation({
 
     for (const theme of args.themes) {
       const themeKey = normalize(theme.name);
-      const themeId = await ctx.db.insert("themes", {
-        conversationId,
-        name: theme.name,
-        nameNormalized: themeKey,
-        description: theme.description,
-        keywords: theme.keywords,
-        eventTitles: theme.eventTitles,
-        confidence: theme.confidence,
-        createdAt: now,
-      });
+      const existingGlobalThemes = await ctx.db
+        .query("themes")
+        .withIndex("by_name_normalized", (q) => q.eq("nameNormalized", themeKey))
+        .take(1);
+
+      let themeId: Id<"themes">;
+
+      if (existingGlobalThemes.length > 0) {
+        const existingTheme = existingGlobalThemes[0];
+
+        await ctx.db.patch(existingTheme._id, {
+          description: mergeSummary(existingTheme.description, theme.description),
+          keywords: mergeUniqueStrings(existingTheme.keywords, theme.keywords),
+          eventTitles: mergeUniqueStrings(existingTheme.eventTitles, theme.eventTitles),
+          confidence: Math.max(existingTheme.confidence, theme.confidence),
+        });
+
+        themeId = existingTheme._id;
+      } else {
+        themeId = await ctx.db.insert("themes", {
+          conversationId,
+          name: theme.name,
+          nameNormalized: themeKey,
+          description: theme.description,
+          keywords: theme.keywords,
+          eventTitles: theme.eventTitles,
+          confidence: theme.confidence,
+          createdAt: now,
+        });
+      }
 
       themeIdsByName.set(themeKey, themeId);
     }
 
-    const personLinkSet = new Set<string>();
-
-    for (const person of args.people) {
-      const personId = personIdsByName.get(normalize(person.name));
-      if (!personId) continue;
-
-      const tokens = [person.name, ...person.aliases]
-        .map(normalize)
-        .filter((token) => token.length > 1);
-
-      for (const message of args.messages) {
-        const messageId = messageIdsByLine.get(message.line);
-        if (!messageId) continue;
-
-        const speaker = normalize(message.speaker);
-        const text = message.text.toLowerCase();
-        const speakerMatch = tokens.includes(speaker);
-        const textMatch = tokens.some((token) => token.length > 2 && text.includes(token));
-
-        if (!speakerMatch && !textMatch) {
-          continue;
-        }
-
-        const key = `${messageId}:${personId}`;
-        if (personLinkSet.has(key)) continue;
-        personLinkSet.add(key);
-
-        await ctx.db.insert("messagePeople", {
-          conversationId,
-          messageId,
-          personId,
-          createdAt: now,
-        });
-      }
-    }
-
     const eventLinkSet = new Set<string>();
 
-    for (const [eventKey, messageIds] of eventMessageIds.entries()) {
+    for (const [eventKey, eventMessageIdsSet] of eventMessageIds.entries()) {
       const eventId = eventIdsByTitle.get(eventKey);
       if (!eventId) continue;
 
-      for (const messageId of messageIds) {
+      for (const messageId of eventMessageIdsSet) {
         const key = `${messageId}:${eventId}`;
         if (eventLinkSet.has(key)) continue;
         eventLinkSet.add(key);
@@ -529,12 +770,9 @@ export const saveConversationAnalysis = mutation({
           .map(normalize)
           .filter((keyword) => keyword.length > 2);
 
-        for (const message of args.messages) {
-          const messageId = messageIdsByLine.get(message.line);
-          if (!messageId) continue;
-
+        for (const message of messages) {
           if (keywordTokens.some((token) => message.text.toLowerCase().includes(token))) {
-            linkedMessageIds.add(messageId);
+            linkedMessageIds.add(message._id);
           }
         }
       }
@@ -553,12 +791,12 @@ export const saveConversationAnalysis = mutation({
       }
     }
 
-    logConvex("info", "save_done", { conversationId });
+    await ctx.db.patch(conversationId, {
+      status: "completed",
+      analyzedAt: now,
+    });
 
-    return {
-      conversationId,
-      duplicate: false,
-    };
+    logConvex("info", "save_phase3_done", { conversationId });
   },
 });
 
@@ -639,46 +877,102 @@ export const findPeopleByFirstNames = query({
       firstName: string;
       personName: string;
       lastNames: string[];
-      aliases: string[];
-      activeConversationId: string[];
-      passiveConversationId: string[];
     }> = [];
 
-    const added = new Set<string>();
-
-    for (const firstName of requested) {
+    for (const req of requested) {
       const matches = await ctx.db
         .query("people")
-        .withIndex("by_first_name_normalized", (q) => q.eq("firstNameNormalized", firstName))
-        .take(200);
+        .withIndex("by_first_name_normalized", (q) => q.eq("firstNameNormalized", req))
+        .take(50);
 
-      for (const person of matches) {
-        if (added.has(person._id)) continue;
-        added.add(person._id);
-
+      for (const match of matches) {
         rows.push({
-          firstName,
-          personName: displayName(person.firstName, person.lastNames),
-          lastNames: person.lastNames,
-          aliases: person.aliases,
-          activeConversationId: person.activeConversationId,
-          passiveConversationId: person.passiveConversationId,
+          firstName: match.firstName,
+          personName: displayName(match.firstName, match.lastNames),
+          lastNames: match.lastNames,
         });
       }
     }
 
-    logConvex("info", "find_people_by_first_names_done", { resultCount: rows.length });
+    logConvex("info", "find_people_by_first_names_done", { matchCount: rows.length });
     return rows;
+  },
+});
+
+export const listPeopleForIdentityReview = query({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    const rawPeople = await ctx.db
+      .query("people")
+      .withIndex("by_creation_time")
+      .order("desc")
+      .take(100);
+
+    const people: Array<{
+      id: Id<"people">;
+      name: string;
+      firstName: string;
+      lastNames: string[];
+      aliases: string[];
+      summary: string;
+    }> = [];
+
+    for (const p of rawPeople) {
+      people.push({
+        id: p._id,
+        name: displayName(p.firstName, p.lastNames),
+        firstName: p.firstName,
+        lastNames: p.lastNames,
+        aliases: p.aliases || [],
+        summary: p.summary || "",
+      });
+    }
+
+    return people;
   },
 });
 
 export const listConversations = query({
   args: {},
   handler: async (ctx) => {
-    return await ctx.db
-      .query("conversations")
-      .order("desc")
-      .take(50);
+    const rows = await ctx.db.query("conversations").order("desc").take(50);
+    return rows.map((row) => ({
+      _id: row._id,
+      title: row.title,
+      status: row.status,
+      createdAt: row.createdAt,
+      analyzedAt: row.analyzedAt,
+    }));
+  },
+});
+
+export const getGlobalContext = query({
+  args: {},
+  handler: async (ctx) => {
+    const people = await ctx.db.query("people").order("desc").take(100);
+    const events = await ctx.db.query("events").order("desc").take(100);
+    const themes = await ctx.db.query("themes").order("desc").take(100);
+
+    return {
+      people: people.map((p) => ({
+        id: p._id,
+        name: displayName(p.firstName, p.lastNames),
+        summary: p.summary,
+        aliases: p.aliases,
+      })),
+      events: events.map((e) => ({
+        id: e._id,
+        title: e.title,
+        description: e.description,
+        participants: e.participants,
+        timeframe: e.timeframe,
+      })),
+      themes: themes.map((t) => ({
+        id: t._id,
+        name: t.name,
+        description: t.description,
+      })),
+    };
   },
 });
 
@@ -686,7 +980,6 @@ export const getConversationWithAnalysis = query({
   args: { conversationId: v.id("conversations") },
   handler: async (ctx, args) => {
     const conversation = await ctx.db.get(args.conversationId);
-
     if (!conversation) {
       return null;
     }
@@ -694,67 +987,45 @@ export const getConversationWithAnalysis = query({
     const messages = await ctx.db
       .query("messages")
       .withIndex("by_conversation_and_line", (q) => q.eq("conversationId", args.conversationId))
-      .order("asc")
-      .take(5000);
+      .collect();
 
     const messagePeople = await ctx.db
       .query("messagePeople")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .take(5000);
+      .collect();
 
-    const uniquePersonIds = new Set<Id<"people">>();
-    for (const link of messagePeople) {
-      uniquePersonIds.add(link.personId);
-    }
-
-    const people = [];
-    for (const personId of uniquePersonIds) {
-      const person = await ctx.db.get(personId);
-      if (person) {
-        people.push(person);
-      }
-    }
-
-    const events = await ctx.db
-      .query("events")
+    const messageEvents = await ctx.db
+      .query("messageEvents")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .take(500);
+      .collect();
 
-    const themes = await ctx.db
-      .query("themes")
+    const messageThemes = await ctx.db
+      .query("messageThemes")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .take(500);
+      .collect();
+
+    const peopleDocs = await Promise.all(
+      Array.from(new Set(messagePeople.map((mp) => mp.personId))).map((id) => ctx.db.get(id)),
+    );
+
+    const eventDocs = await Promise.all(
+      Array.from(new Set(messageEvents.map((me) => me.eventId))).map((id) => ctx.db.get(id)),
+    );
+
+    const themeDocs = await Promise.all(
+      Array.from(new Set(messageThemes.map((mt) => mt.themeId))).map((id) => ctx.db.get(id)),
+    );
 
     return {
       conversation,
-      analysis: {
-        messages: messages.map((message) => ({
-          speaker: message.speaker,
-          text: message.text,
-          timestamp: message.timestamp,
-          line: message.line,
-        })),
-        people: people.map((person) => ({
-          name: displayName(person.firstName, person.lastNames),
-          aliases: person.aliases,
-          summary: person.summary,
-          messageCount: person.activeMessageCount + person.passiveMessageCount,
-        })),
-        events: events.map((event) => ({
-          title: event.title,
-          description: event.description,
-          participants: event.participants,
-          timeframe: event.timeframe,
-          evidenceLines: event.evidenceLines,
-          topics: event.topics,
-        })),
-        themes: themes.map((theme) => ({
-          name: theme.name,
-          description: theme.description,
-          keywords: theme.keywords,
-          eventTitles: theme.eventTitles,
-          confidence: theme.confidence,
-        })),
+      messages,
+      people: peopleDocs.filter((d): d is Doc<"people"> => d !== null),
+      events: eventDocs.filter((d): d is Doc<"events"> => d !== null),
+      themes: themeDocs.filter((d): d is Doc<"themes"> => d !== null),
+      links: {
+        messagePeople,
+        messageEvents,
+        messageThemes,
       },
     };
   },
