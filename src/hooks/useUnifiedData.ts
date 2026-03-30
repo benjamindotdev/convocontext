@@ -1,6 +1,7 @@
+import { normalize, eventSignalTokens } from "@/lib/shared";
 import { useMemo } from "react";
 import { MessageRef, SessionChat, UnifiedPerson, UnifiedEvent, UnifiedTheme } from "@/lib/types";
-import { normalize, eventSignalTokens } from "@/lib/utils";
+
 
 export function useUnifiedData(sessionChats: SessionChat[]) {
   return useMemo(() => {

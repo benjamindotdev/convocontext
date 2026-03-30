@@ -146,35 +146,7 @@ export function isConversationBreak(
   return next.line - message.line > 120;
 }
 
-export const EVENT_LINK_STOP_WORDS = new Set([
-  "the",
-  "and",
-  "that",
-  "with",
-  "from",
-  "this",
-  "your",
-  "have",
-  "been",
-  "were",
-  "what",
-  "when",
-  "where",
-  "which",
-  "while",
-  "would",
-  "could",
-  "should",
-  "about",
-  "there",
-  "their",
-  "them",
-  "they",
-  "just",
-  "very",
-  "more",
-  "some",
-]);
+
 
 export function eventSignalTokens(event: {
   title: string;

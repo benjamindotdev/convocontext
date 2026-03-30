@@ -1,8 +1,9 @@
+import { normalize } from "@/lib/shared";
 import { useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { UnifiedPerson } from "@/lib/types";
-import { normalize } from "@/lib/utils";
+
 import { ContentTab } from "./ContentTab";
 
 export function PeopleTab({ people }: { people: UnifiedPerson[] }) {

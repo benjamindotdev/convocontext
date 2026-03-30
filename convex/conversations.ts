@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { v } from "convex/values";
+import { normalize, eventSignalTokens } from "../src/lib/shared";
 
 const messageValidator = v.object({
   speaker: v.string(),

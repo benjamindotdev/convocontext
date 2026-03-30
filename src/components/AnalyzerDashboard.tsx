@@ -1,5 +1,7 @@
-import { sha256Hex } from "@/lib/utils";
 "use client";
+
+import { sha256Hex } from "@/lib/utils";
+
 
 import { useEffect, useState } from "react";
 import { PeopleReviewModal} from "@/components/PeopleReviewModal";
